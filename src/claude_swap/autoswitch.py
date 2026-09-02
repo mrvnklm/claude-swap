@@ -599,6 +599,8 @@ def _every_account_above_threshold(
     headroom: dict[str, float | None],
     active_headroom: float | None,
     threshold: float,
+    pressures: dict[str, float | None] | None = None,
+    active_pressure: float | None = None,
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
     the threshold — the state where "land somewhere healthy" has no answer.
@@ -609,12 +611,156 @@ def _every_account_above_threshold(
     verdict (it may be healthy, but it cannot be *chosen* either — the caller
     skips ``None`` headroom) as long as at least one candidate was measured.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    # Measured as pressure — each window against its own line — when the
+    # caller supplies it, so this verdict cannot disagree with the trigger and
+    # the landing gate about what "above the threshold" means. Falls back to
+    # the single scalar when it does not, which is what every existing caller
+    # and test does.
+    def over(num: str | None, head: float | None) -> bool | None:
+        if pressures is not None:
+            ratio = active_pressure if num is None else pressures.get(num)
+            if ratio is not None:
+                return ratio >= 1.0
+        if head is None:
+            return None
+        return (100.0 - head) >= threshold
+
+    if active_headroom is None:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    if not over(None, active_headroom):
+        return False
+    measured = [
+        over(n, headroom.get(n)) for n in candidates if headroom.get(n) is not None
+    ]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all(measured)
+
+
+def strategy_sort_key(
+    *,
+    headroom: float,
+    consume_first: bool,
+    all_above: bool,
+    by_recovery: bool,
+    recovery_ts: float,
+    reset_ts: float | None,
+) -> tuple:
+    """The order a strategy prefers accounts in. Ascending; ties keep list order.
+
+    Extracted so a DISPLAY can show the same order the engine will act on. The
+    two used to be written separately and disagreed: the auto screen sorted by
+    utilization while claiming in its own comment to match the engine, so under
+    consume-first the list contradicted the next switch.
+
+    This is the ORDER only — the admission gates that decide whether a
+    candidate is eligible at all live in `_rank_candidates` and are not
+    reproduced here. A display showing this is answering "which would be
+    preferred", not "which will be chosen".
+    """
+    if all_above:
+        # Tiered so a candidate returning inside the horizon beats one that
+        # does not, whatever its headroom: untiered, a raw headroom and an
+        # epoch timestamp were compared elementwise and headroom won on
+        # magnitude alone.
+        return (0, recovery_ts, -headroom) if by_recovery else (1, -headroom, recovery_ts)
+    if consume_first:
+        # Soonest deadline first (unknown sorts last), most headroom breaks ties.
+        return (reset_ts if reset_ts is not None else float("inf"), -headroom)
+    return (-headroom,)
+
+
+def preference_order(
+    usage: dict[str, dict | str | None],
+    *,
+    models: tuple[str, ...] = (),
+    consume_first: bool = False,
+    now: float,
+    cancel_ends: dict[str, float] | None = None,
+) -> list[str]:
+    """Accounts in the order the configured strategy prefers them.
+
+    For DISPLAY. It answers "which account would this strategy reach for
+    next", not "which will the engine choose": the admission gates — landing
+    health, the no-return bar, hysteresis, quarantine, live sessions — are
+    deliberately not applied, because a list that hid an account for a reason
+    that expires in four minutes would be more confusing than one that shows
+    the preference and lets the engine explain the rest.
+
+    Accounts whose usage cannot be read sort last, in their existing order:
+    unknown is not the same as bad, and guessing a position for one would put
+    it somewhere the engine never would.
+    """
+    ends = cancel_ends or {}
+    known: list[tuple[tuple, str]] = []
+    unknown: list[str] = []
+    for num, value in usage.items():
+        headroom = oauth.account_headroom(value if isinstance(value, dict) else None, models)
+        if headroom is None:
+            unknown.append(num)
+            continue
+        reset_ts = (
+            merge_deadline(_seven_day_reset_ts(value, now), ends.get(num))
+            if consume_first
+            else None
+        )
+        known.append((
+            strategy_sort_key(
+                headroom=headroom,
+                consume_first=consume_first,
+                all_above=False,
+                by_recovery=False,
+                recovery_ts=0.0,
+                reset_ts=reset_ts,
+            ),
+            num,
+        ))
+    known.sort(key=lambda t: t[0])
+    return [num for _, num in known] + unknown
+
+
+def window_threshold(label: str, settings: AutoSwitchSettings) -> float:
+    """The switch line for one window.
+
+    The 5h and weekly windows want opposite values and a single scalar
+    compared against ``max(pct)`` cannot express that. Quota not spent before a
+    WEEKLY reset is gone for good, so that window wants an aggressive line;
+    overshooting the 5h window costs one interrupted turn and the window
+    recycles in hours. Both fall back to ``threshold``, so a configuration that
+    sets neither behaves exactly as it did before.
+
+    Every window that is not the 5h one is weekly — the 7d window and each
+    per-model scoped window, which reset on the same cadence.
+    """
+    if label == "5h":
+        return settings.threshold_five_hour or settings.threshold
+    return settings.threshold_weekly or settings.threshold
+
+
+def pressure(
+    usage: dict | str | None,
+    models: tuple[str, ...],
+    settings: AutoSwitchSettings,
+) -> float | None:
+    """How close this account is to the first line it will cross, as a ratio.
+
+    ``>= 1.0`` means some window has reached its own threshold. None when no
+    window is readable — never 0.0, which would read as "plenty of room".
+
+    A ratio rather than a percentage because the windows no longer share a
+    line: comparing ``max(pct)`` against the binding window's threshold looks
+    equivalent and is not. With 5h at 89.5 (line 90) and 7d at 94 (line 95) no
+    window has crossed anything, yet ``max(pct) = 94`` clears the 5h line of 90
+    and would fire. Dividing each window by its own line keeps the comparison
+    honest, and collapses to the old behaviour exactly when the lines are equal.
+    """
+    windows = oauth.relevant_windows(usage if isinstance(usage, dict) else None, models)
+    ratios = [
+        pct / window_threshold(label, settings)
+        for label, pct, _ in windows
+        if window_threshold(label, settings) > 0
+    ]
+    return max(ratios) if ratios else None
 
 
 def _ref(number: str, email: str) -> dict:
@@ -980,7 +1126,14 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            # Per-window lines: each window is measured against its OWN
+            # threshold and the closest one decides. Falls back to the single
+            # `threshold` for both when neither override is set, so an existing
+            # configuration triggers exactly where it did before.
+            active_pressure = pressure(usage.get(current), self._models, settings)
+            if active_pressure is None:
+                active_pressure = utilization / settings.threshold if settings.threshold else 0.0
+            if active_pressure < 1.0:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -1856,7 +2009,15 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates,
+            headroom,
+            active_headroom,
+            settings.threshold,
+            pressures={
+                n: pressure(usage.get(n), self._models, settings)
+                for n in oauth_candidates
+            },
+            active_pressure=pressure(usage.get(current), self._models, settings),
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -1915,7 +2076,12 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                cand_pressure = pressure(usage.get(num), self._models, settings)
+                if cand_pressure is None:
+                    cand_pressure = (
+                        (100.0 - h) / settings.threshold if settings.threshold else 0.0
+                    )
+                if cand_pressure >= 1.0 and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -2002,15 +2168,23 @@ class AutoSwitchEngine:
                 # whichever came first in the list. Headroom still decides
                 # first within the tier; the reset only breaks its ties, where
                 # sooner is plainly better than lower slot number.
-                key: tuple = (
-                    (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
+                key: tuple = strategy_sort_key(
+                    headroom=h,
+                    consume_first=consume_first,
+                    all_above=True,
+                    by_recovery=by_recovery,
+                    recovery_ts=recovery_ts,
+                    reset_ts=reset_ts,
                 )
-            elif consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
-                key = (-h,)
+                key = strategy_sort_key(
+                    headroom=h,
+                    consume_first=consume_first,
+                    all_above=False,
+                    by_recovery=False,
+                    recovery_ts=recovery_ts,
+                    reset_ts=reset_ts,
+                )
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback

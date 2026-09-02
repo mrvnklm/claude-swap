@@ -15,6 +15,9 @@ import pytest
 from claude_swap import cancellation, host_claim, oauth, poll_policy
 from claude_swap.identity import identity_key
 from claude_swap.autoswitch import (
+    _seven_day_reset_ts,
+    strategy_sort_key,
+    preference_order,
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
@@ -7216,4 +7219,151 @@ class TestPeerClaims:
         h = self._harness(temp_home)
         with patch.object(host_claim, "publish", side_effect=OSError("nope")):
             assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+
+class TestPreferenceOrder:
+    """The order a display shows must be the order the engine prefers."""
+
+    NOW = 1_000_000.0
+
+    def test_best_orders_by_headroom(self):
+        order = preference_order({
+            "1": _usage7(90, 10), "2": _usage7(5, 5), "3": _usage7(50, 50),
+        }, now=self.NOW)
+        assert order == ["2", "3", "1"]
+
+    def test_consume_first_orders_by_deadline_not_headroom(self):
+        # The whole point: most headroom loses to soonest reset.
+        order = preference_order({
+            "1": _usage7(5, 5, _R_LATEST),   # most headroom, resets last
+            "2": _usage7(60, 60, _R_SOON),   # least headroom, resets first
+        }, now=self.NOW, consume_first=True)
+        assert order == ["2", "1"]
+
+    def test_an_unknown_reset_sorts_after_a_known_one(self):
+        order = preference_order({
+            "1": _usage7(5, 5), "2": _usage7(5, 5, _R_SOON),
+        }, now=self.NOW, consume_first=True)
+        assert order == ["2", "1"]
+
+    def test_a_cancellation_moves_an_account_up(self):
+        order = preference_order(
+            {"1": _usage7(5, 5, _R_SOON), "2": _usage7(5, 5, _R_LATEST)},
+            now=self.NOW, consume_first=True,
+            cancel_ends={"2": self.NOW + 60},
+        )
+        assert order == ["2", "1"]
+
+    def test_unreadable_accounts_sort_last_in_their_own_order(self):
+        # Unknown is not the same as bad; guessing a rank would put them
+        # somewhere the engine never would.
+        order = preference_order({
+            "1": USAGE_TOKEN_EXPIRED, "2": _usage7(50, 50), "3": None,
+        }, now=self.NOW)
+        assert order == ["2", "1", "3"]
+
+    def test_it_matches_the_engines_own_key(self):
+        # One definition, not two: the display sorting differently from the
+        # engine is exactly the bug this replaced.
+        usage = {"1": _usage7(5, 5, _R_LATEST), "2": _usage7(60, 60, _R_SOON)}
+        keys = {
+            num: strategy_sort_key(
+                headroom=oauth.account_headroom(u, ()),
+                consume_first=True, all_above=False, by_recovery=False,
+                recovery_ts=0.0, reset_ts=_seven_day_reset_ts(u, self.NOW),
+            )
+            for num, u in usage.items()
+        }
+        expected = [n for n, _ in sorted(keys.items(), key=lambda kv: kv[1])]
+        assert preference_order(usage, now=self.NOW, consume_first=True) == expected
+
+
+class TestPerWindowThresholds:
+    """5h and weekly want opposite lines; one scalar cannot express that."""
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_weekly_window_below_its_own_line_does_not_trigger(self, temp_home):
+        # 7d at 92 with a weekly line of 95: nothing has been crossed, even
+        # though the old single threshold of 90 would have fired.
+        h = self._harness(temp_home, threshold=90.0, threshold_weekly=95.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 92), "2": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_the_same_weekly_window_triggers_once_it_crosses(self, temp_home):
+        h = self._harness(temp_home, threshold=90.0, threshold_weekly=95.0)
+        assert h.tick_with_usage({
+            "1": _usage7(10, 96), "2": _usage7(5, 5),
+        }) is TickOutcome.SWITCHED
+
+    def test_the_session_window_keeps_its_own_lower_line(self, temp_home):
+        # 5h at 91 with a session line of 90 fires, while the weekly line of
+        # 95 is nowhere near — the asymmetry the single scalar could not hold.
+        h = self._harness(temp_home, threshold=90.0, threshold_five_hour=90.0,
+                          threshold_weekly=95.0)
+        assert h.tick_with_usage({
+            "1": _usage7(91, 10), "2": _usage7(5, 5),
+        }) is TickOutcome.SWITCHED
+
+    def test_the_false_positive_the_naive_form_would_have(self, temp_home):
+        # 5h 89.5 (line 90) and 7d 94 (line 95): NO window has crossed. A
+        # comparison of max(pct) against the binding window's line would read
+        # 94 >= 90 and fire.
+        h = self._harness(temp_home, threshold=90.0, threshold_five_hour=90.0,
+                          threshold_weekly=95.0)
+        assert h.tick_with_usage({
+            "1": _usage7(89.5, 94), "2": _usage7(5, 5),
+        }) is TickOutcome.NO_ACTION
+
+    def test_without_overrides_the_behaviour_is_unchanged(self, temp_home):
+        # The control: one line for both, exactly as before.
+        h = self._harness(temp_home, threshold=90.0)
+        assert h.tick_with_usage({
+            "1": _usage7(10, 94), "2": _usage7(5, 5),
+        }) is TickOutcome.SWITCHED
+
+    def test_a_candidate_over_its_own_line_is_not_landed_on(self, temp_home):
+        # The landing gate has to read the same lines as the trigger, or the
+        # engine would leave one account for another it considers just as bad.
+        h = EngineHarness(temp_home, threshold=90.0, threshold_five_hour=90.0,
+                          threshold_weekly=95.0)
+        for num, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(num, email)
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10),    # active over its 5h line -> must move
+            "2": _usage7(93, 10),    # also over its 5h line -> not a landing
+            "3": _usage7(5, 5),      # healthy
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_candidate_under_its_weekly_line_is_landable(self, temp_home):
+        """The case that separates the per-window gate from the old scalar.
+
+        The only candidate sits at 7d 93. Against a single line of 90 it is
+        "too full to land on" and the tick has nowhere to go; against its own
+        weekly line of 95 it has room, which is the whole point of splitting
+        them — weekly quota is what consume-first exists to spend.
+        """
+        # hysteresis off: `best` also requires the candidate to beat the
+        # active account by that margin, and at these percentages it would
+        # reject the candidate for a reason that has nothing to do with the
+        # gate under test.
+        h = self._harness(temp_home, threshold=90.0, threshold_five_hour=90.0,
+                          threshold_weekly=95.0, hysteresis_pct=0.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10),   # active over its 5h line -> must move
+            "2": _usage7(10, 93),   # under its weekly line -> a valid landing
+        })
+        assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
