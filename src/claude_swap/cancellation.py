@@ -44,34 +44,13 @@ from datetime import date, datetime, time, tzinfo
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
+from claude_swap.identity import identity_key, slots_by_key
 from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
 STATE_FILENAME = "autoswitch_state.json"
 LOCK_FILENAME = ".autoswitch_state.lock"
 CANCELLED_KEY = "cancelled"
-KEY_SEP = ":"
-
-
-# -- identity ----------------------------------------------------------------
-
-
-def identity_key(identity: Mapping) -> str | None:
-    """``<uuid>:<organizationUuid>`` for an account, or None if either half is missing.
-
-    Both halves are required. The uuid alone is not an identity — one account
-    can hold seats in two organizations and appear as two managed slots — and
-    the organization alone is not either. A slot missing either half cannot be
-    marked, which is the safe refusal: a mark that cannot name its account
-    would be applied by position, which is the bug this key exists to remove.
-    """
-    if not isinstance(identity, Mapping):
-        return None
-    uuid = str(identity.get("uuid") or "").strip()
-    org = str(identity.get("organizationUuid") or "").strip()
-    if not uuid or not org:
-        return None
-    return f"{uuid}{KEY_SEP}{org}"
 
 
 @dataclass(frozen=True)
@@ -207,22 +186,6 @@ def merge_deadline(
 # -- the one reader ----------------------------------------------------------
 
 
-def _slots_by_key(identities: Mapping[str, Mapping]) -> dict[str, str]:
-    """``{identity key: slot}``, lowest slot wins a duplicate.
-
-    Two slots can end up carrying the same identity after a botched add. Either
-    answer is arbitrary, so the tie is broken deterministically rather than by
-    dict order — which is how the two resolvers this replaced came to disagree,
-    one keeping the last match and the other the first.
-    """
-    out: dict[str, str] = {}
-    for slot in sorted(identities, key=lambda n: (not str(n).isdigit(), str(n).zfill(9))):
-        key = identity_key(identities[slot])
-        if key is not None and key not in out:
-            out[key] = str(slot)
-    return out
-
-
 def resolve_marks(
     state: dict,
     identities: Mapping[str, Mapping],
@@ -241,7 +204,7 @@ def resolve_marks(
     listing, and both delete paths — so they cannot disagree about which
     account a mark names or whether it still says anything.
     """
-    by_key = _slots_by_key(identities)
+    by_key = slots_by_key(identities)
 
     marks: list[Mark] = []
     for key, record in cancellations(state).items():
