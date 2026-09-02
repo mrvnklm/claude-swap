@@ -982,6 +982,8 @@ this machine: run the same command on each machine you use.
         parser.error("--prune takes no other arguments")
     if args.unset and args.account is None:
         parser.error("NUM|EMAIL is required with --unset")
+    if args.ends and args.account is None:
+        parser.error("NUM|EMAIL is required with --ends")
     if args.account is not None and not args.unset and not args.ends:
         parser.error("--ends YYYY-MM-DD is required (or pass --unset to remove a mark)")
 
@@ -996,6 +998,21 @@ this machine: run the same command on each machine you use.
         )
 
         if args.prune:
+            # An account whose slot carries no identity cannot be matched, so
+            # every mark would look orphaned and --prune would delete valid
+            # ones. Refuse rather than destroy: the roster is the thing that is
+            # wrong, and it is recoverable while the marks still exist.
+            unkeyable = [
+                slot for slot, ident in identities.items()
+                if cancellation.identity_key(ident) is None
+            ]
+            if unkeyable:
+                raise ConfigError(
+                    "slot(s) " + ", ".join(sorted(unkeyable)) + " carry no account/"
+                    "organization id, so marks cannot be matched against them and "
+                    "--prune could delete valid ones. Run 'cswap list' to refresh "
+                    "the roster first."
+                )
             orphans = [m.key for m in marks if m.orphaned]
             if not orphans:
                 print(dimmed("No marks without a managed account"))
@@ -1012,8 +1029,9 @@ this machine: run the same command on each machine you use.
         key = cancellation.identity_key(identities.get(str(account_num), {}))
         if key is None:
             raise ConfigError(
-                f"{email} has no stored account/organization id, so it cannot be "
-                "marked. Re-add it (cswap add) to record one."
+                f"{email} (slot {account_num}) has no stored account/organization "
+                "id, so a mark could not name it. Run 'cswap list' once — it "
+                "resolves and records the ids — then try again."
             )
 
         if args.unset:
@@ -1063,7 +1081,10 @@ def _print_cancellation_marks(switcher, marks) -> None:
         ends = mark.ends_on.isoformat() if mark.ends_on else "?"
         state = ""
         if mark.lapsed:
-            state = warning("  (lapsed — ignored)")
+            # `warning()` PRINTS and returns None — it is not a formatter like
+            # accent/muted/dimmed. Using it inline put the tag on the line
+            # above the row it described and appended a literal "None".
+            state = muted("  (lapsed — ignored)")
         elif mark.orphaned:
             state = muted("  (cswap cancel --prune to remove)")
         print(f"  {where}: {mark.email or '?'} · org {org} — through {ends}{state}")
@@ -1084,11 +1105,9 @@ def _warn_if_marks_are_inert(switcher) -> None:
     except Exception:
         return
     if strategy != "consume-first":
-        print(
-            warning(
-                f"  note: autoswitch.strategy is '{strategy}', which ignores "
-                "cancellation marks."
-            )
+        warning(
+            f"  note: autoswitch.strategy is '{strategy}', which ignores "
+            "cancellation marks."
         )
         print(
             dimmed(

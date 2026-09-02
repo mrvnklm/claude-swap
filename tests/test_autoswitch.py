@@ -7062,6 +7062,36 @@ class TestCancelledAccountsDrainFirst:
         assert h.tick_with_usage(self.ACTIVE_RESETS_SOONEST) is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
+    # The active account is AT ITS LIMIT, so the tick escapes. at-limit and
+    # failover deliberately skip the landing-health gate — there the engine is
+    # fleeing a dead account, not choosing a good one — and the shipped sort
+    # key branches on the STRATEGY rather than the trigger, so under
+    # consume-first the escape also ranks by soonest reset. A mark's value is
+    # always at or before now, so an unscoped mark would win that sort at any
+    # headroom.
+    ACTIVE_AT_LIMIT = {
+        "1": _usage7(100, 100, _R_LATER),   # active: no headroom -> at-limit
+        "2": _usage7(5, 5, _R_LATEST),      # healthy, resets last
+        "3": _usage7(99, 99, _R_LATEST),    # nearly spent, resets last
+    }
+
+    def test_a_mark_cannot_steer_an_at_limit_escape_onto_a_spent_account(self, temp_home):
+        """Without the trigger scoping the escape lands on the 99%-used marked
+        account instead of the 5%-used peer, and the cooldown then holds it
+        there for five minutes — the session-costing state the threshold
+        exists to prevent."""
+        h = self._harness(temp_home)
+        self._mark(h, "3", self.ENDS_BEFORE_SOON)
+        assert h.tick_with_usage(self.ACTIVE_AT_LIMIT) is TickOutcome.SWITCHED
+        assert h.active_number() == 2, "the mark steered the escape onto a spent account"
+
+    def test_marks_still_apply_to_the_proactive_trigger(self, temp_home):
+        # The scoping must not switch the feature off for the trigger it is for.
+        h = self._harness(temp_home)
+        self._mark(h, "3", self.ENDS_BEFORE_SOON)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_the_lock_and_state_paths_match_the_engine(self, temp_home):
         """Kills the mutations that delete the CLI lock or point it elsewhere."""
         h = self._harness(temp_home)

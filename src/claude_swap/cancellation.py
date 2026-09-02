@@ -207,6 +207,22 @@ def merge_deadline(
 # -- the one reader ----------------------------------------------------------
 
 
+def _slots_by_key(identities: Mapping[str, Mapping]) -> dict[str, str]:
+    """``{identity key: slot}``, lowest slot wins a duplicate.
+
+    Two slots can end up carrying the same identity after a botched add. Either
+    answer is arbitrary, so the tie is broken deterministically rather than by
+    dict order — which is how the two resolvers this replaced came to disagree,
+    one keeping the last match and the other the first.
+    """
+    out: dict[str, str] = {}
+    for slot in sorted(identities, key=lambda n: (not str(n).isdigit(), str(n).zfill(9))):
+        key = identity_key(identities[slot])
+        if key is not None and key not in out:
+            out[key] = str(slot)
+    return out
+
+
 def resolve_marks(
     state: dict,
     identities: Mapping[str, Mapping],
@@ -221,15 +237,11 @@ def resolve_marks(
     than being hidden: an orphan is exactly what the operator needs to see and
     remove, and hiding it is how the previous shape made one unremovable.
 
-    This is the ONLY place a stored record becomes a decision. The engine, the
-    listing and the delete path all read through it, so they cannot disagree
-    about what a mark means.
+    Every reader goes through here — the engine via ``deadlines_by_slot``, the
+    listing, and both delete paths — so they cannot disagree about which
+    account a mark names or whether it still says anything.
     """
-    by_key: dict[str, str] = {}
-    for slot, identity in identities.items():
-        key = identity_key(identity)
-        if key is not None:
-            by_key[key] = str(slot)
+    by_key = _slots_by_key(identities)
 
     marks: list[Mark] = []
     for key, record in cancellations(state).items():
@@ -259,18 +271,19 @@ def deadlines_by_slot(
 ) -> dict[str, float]:
     """``{slot: expiry timestamp}`` for every live, resolvable mark.
 
-    Lapsed marks and orphans are absent, so a caller that merges this into a
-    deadline can never rank on one.
+    Built on ``resolve_marks`` so the engine and the listing cannot disagree
+    about which account a mark names — they did, when this was a second matcher
+    with its own loop. Lapsed marks and orphans are absent, so a caller that
+    merges this into a deadline can never rank on one.
     """
     out: dict[str, float] = {}
-    for key, record in cancellations(state).items():
-        ts = ends_ts(record, now, tz=tz)
-        if ts is None:
+    records = cancellations(state)
+    for mark in resolve_marks(state, identities, now, tz=tz):
+        if mark.slot is None or mark.lapsed:
             continue
-        for slot, identity in identities.items():
-            if identity_key(identity) == str(key):
-                out[str(slot)] = ts
-                break
+        ts = ends_ts(records.get(mark.key), now, tz=tz)
+        if ts is not None:
+            out[mark.slot] = ts
     return out
 
 

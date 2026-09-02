@@ -1661,33 +1661,37 @@ class TestCancelCommand:
     def test_an_end_date_is_required(self, tmp_path, capsys):
         # The derivation from the billing anniversary was dropped: no field in
         # the stored account names a billing interval, so it was a guess.
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc:
             self._run(["cancel", "4"], tmp_path)
+        assert exc.value.code != 0
         assert "--ends" in capsys.readouterr().err
         assert self._marks(tmp_path) == {}
 
     def test_a_malformed_end_date_is_rejected(self, tmp_path, capsys):
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc:
             self._run(["cancel", "4", "--ends", "08.09.2026"], tmp_path)
+        assert exc.value.code != 0
         assert "YYYY-MM-DD" in capsys.readouterr().err
         assert self._marks(tmp_path) == {}
 
     def test_an_end_date_already_past_is_refused(self, tmp_path, capsys):
         # A lapsed mark reads as no mark, so recording one would silently do
         # nothing — better to say so than to accept a typo.
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc:
             self._run(["cancel", "4", "--ends", "2020-01-01"], tmp_path)
+        assert exc.value.code != 0
         assert "already past" in capsys.readouterr().err
         assert self._marks(tmp_path) == {}
 
     def test_an_account_without_an_identity_cannot_be_marked(self, tmp_path, capsys):
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc:
             self._run(
                 ["cancel", "4", "--ends", self._future()], tmp_path,
                 identities={"4": {"uuid": "", "organizationUuid": "", "email": "d@e.f"}},
             )
+        assert exc.value.code != 0
         captured = capsys.readouterr()
-        assert "cannot be marked" in captured.out + captured.err
+        assert "could not name it" in captured.out + captured.err
         assert self._marks(tmp_path) == {}
 
     def test_unset_removes_the_mark(self, tmp_path):
@@ -1696,13 +1700,15 @@ class TestCancelCommand:
         assert self._marks(tmp_path) == {}
 
     def test_unset_with_ends_is_rejected(self, tmp_path, capsys):
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc:
             self._run(["cancel", "4", "--unset", "--ends", self._future()], tmp_path)
+        assert exc.value.code != 0
         assert "--unset does not take --ends" in capsys.readouterr().err
 
     def test_unset_without_an_account_is_rejected(self, tmp_path, capsys):
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc:
             self._run(["cancel", "--unset"], tmp_path)
+        assert exc.value.code != 0
         assert "required with --unset" in capsys.readouterr().err
 
     def test_bare_cancel_lists_marks_without_resolving_an_account(self, tmp_path, capsys):
@@ -1738,8 +1744,9 @@ class TestCancelCommand:
         assert list(self._marks(tmp_path)) == [self.KEY]
 
     def test_prune_rejects_other_arguments(self, tmp_path, capsys):
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc:
             self._run(["cancel", "4", "--prune"], tmp_path)
+        assert exc.value.code != 0
         assert "no other arguments" in capsys.readouterr().err
 
     def test_it_says_so_when_the_strategy_ignores_marks(self, tmp_path, capsys):
@@ -1753,6 +1760,43 @@ class TestCancelCommand:
         self._run(["cancel", "4", "--ends", self._future()], tmp_path,
                   strategy="consume-first")
         assert "ignores" not in capsys.readouterr().out
+
+    def test_ends_without_an_account_is_rejected(self, tmp_path, capsys):
+        # It used to be silently discarded and the listing printed instead.
+        with pytest.raises(SystemExit) as exc:
+            self._run(["cancel", "--ends", self._future()], tmp_path)
+        assert exc.value.code != 0
+        assert "required with --ends" in capsys.readouterr().err
+
+    def test_prune_refuses_when_a_slot_carries_no_identity(self, tmp_path, capsys):
+        # Every mark would look orphaned, so --prune would delete valid ones.
+        self._run(["cancel", "4", "--ends", self._future()], tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            self._run(
+                ["cancel", "--prune"], tmp_path,
+                identities={"4": {"uuid": "", "organizationUuid": "", "email": "d@e.f"}},
+            )
+        assert exc.value.code != 0
+        assert list(self._marks(tmp_path)) == [self.KEY]
+
+    def test_a_lapsed_mark_is_labelled_in_the_listing(self, tmp_path, capsys):
+        # The only hygiene surface the deferred engine-side prune rests on.
+        from claude_swap import cancellation
+
+        cancellation.set_cancelled(
+            tmp_path, self.KEY, date.today() - timedelta(days=2), email="d@example.com"
+        )
+        self._run(["cancel"], tmp_path)
+        out = capsys.readouterr().out
+        assert "lapsed" in out and "None" not in out
+
+    def test_the_listing_never_prints_a_stray_none(self, tmp_path, capsys):
+        # printer.warning() PRINTS and returns None; using it as a formatter
+        # put the tag on the wrong line and appended a literal "None".
+        self._run(["cancel", "4", "--ends", self._future()], tmp_path)
+        capsys.readouterr()
+        self._run(["cancel"], tmp_path)
+        assert "None" not in capsys.readouterr().out
 
 
 class TestCancelDoesNotBreakExistingFlags:

@@ -177,6 +177,32 @@ class TestResolveMarks:
         assert mark.orphaned
 
 
+class TestDuplicateIdentities:
+    """Two slots can carry the same identity after a botched add. Either answer
+    is arbitrary — but the engine and the listing must give the SAME one, which
+    is how the two resolvers this replaced came to disagree."""
+
+    DUPES = {"6": _ident(UUID_A, ORG_1), "1": _ident(UUID_A, ORG_1)}
+    STATE = _state(**{KEY_1: {"endsOn": "2026-09-08"}})
+
+    def test_the_lowest_slot_wins_deterministically(self):
+        (mark,) = cancellation.resolve_marks(self.STATE, self.DUPES, _ts(2026, 9, 1))
+        assert mark.slot == "1"
+
+    def test_the_engine_and_the_listing_agree(self):
+        (mark,) = cancellation.resolve_marks(self.STATE, self.DUPES, _ts(2026, 9, 1))
+        deadlines = cancellation.deadlines_by_slot(
+            self.STATE, self.DUPES, _ts(2026, 9, 1)
+        )
+        assert list(deadlines) == [mark.slot]
+
+    def test_ordering_of_the_identity_map_does_not_decide(self):
+        reversed_map = dict(reversed(list(self.DUPES.items())))
+        a = cancellation.resolve_marks(self.STATE, self.DUPES, _ts(2026, 9, 1))[0].slot
+        b = cancellation.resolve_marks(self.STATE, reversed_map, _ts(2026, 9, 1))[0].slot
+        assert a == b == "1"
+
+
 class TestDeadlinesBySlot:
     IDENTITIES = {"1": _ident(UUID_A, ORG_1), "2": _ident(UUID_B, ORG_6)}
 

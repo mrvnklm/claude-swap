@@ -1189,11 +1189,29 @@ class AutoSwitchEngine:
         # not look. Correctness lives inside `_rank_candidates`, which reads
         # `ends` only from its own consume-first branches — so deleting this
         # gate changes nothing observable, and no test can kill it.
+        # SCOPED TO THE TRIGGER, not just the strategy. The shipped sort key
+        # branches on `consume_first` alone (autoswitch.py, `elif consume_first`),
+        # so under this strategy an at-limit or failover ESCAPE also ranks by
+        # soonest reset — and those paths deliberately have no landing-health
+        # gate, because there we are fleeing a dead account rather than choosing
+        # a good one. A mark's value is always at or before now while every
+        # peer's weekly reset is in the future, so a marked account would win
+        # that escape sort unconditionally, at any headroom: measured, an
+        # at-limit escape that lands on a 5%-used peer without a mark lands on
+        # the 99%-used marked one with it, and the cooldown then holds it there.
+        # Feeding marks only to the deliberate triggers keeps the inherited
+        # behaviour exactly as shipped instead of amplifying it.
+        #
+        # The `consume_first` half is an OPTIMISATION, not a guard: it skips a
+        # roster read for strategies that will not look, and `_rank_candidates`
+        # reads `ends` only from its own consume-first branches — so deleting
+        # that half alone changes nothing observable. The trigger half IS a
+        # guard and is pinned by a test.
         cancel_ends: dict[str, float] = (
             cancellation.deadlines_by_slot(
                 state, self.switcher.account_identities(), decided_now
             )
-            if consume_first
+            if consume_first and trigger in ("proactive", "consume-first")
             else {}
         )
         ordered, any_known, active_reset_ts = _rank(
