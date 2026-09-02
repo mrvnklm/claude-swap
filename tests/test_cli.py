@@ -1613,3 +1613,84 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     home = Path(_subprocess_env()["HOME"])
     assert home.is_dir(), f"the isolated HOME is not a real directory: {home}"
     assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
+
+
+class TestCancelDispatch:
+    """`cswap cancel` — mark an account whose subscription is ending."""
+
+    STRIPE_CONFIG = json.dumps({
+        "oauthAccount": {
+            "billingType": "stripe_subscription",
+            "subscriptionCreatedAt": "2025-12-22T07:01:44Z",
+        }
+    })
+
+    def _run(self, argv, tmp_path, *, config=STRIPE_CONFIG):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher = switcher_cls.return_value
+            switcher.backup_dir = tmp_path
+            switcher.resolve_account.return_value = ("4", "d@example.com", None)
+            switcher._read_account_config.return_value = config
+            cli.main()
+        return switcher
+
+    def _marks(self, tmp_path):
+        from claude_swap import cancellation
+
+        return cancellation.cancellations(cancellation.read_state(tmp_path))
+
+    def test_derives_the_end_date_from_the_billing_anniversary(self, tmp_path):
+        self._run(["cancel", "4"], tmp_path)
+        record = self._marks(tmp_path)["4"]
+        assert record["email"] == "d@example.com"
+        # The 22nd of some month, derived rather than typed.
+        assert record["endsOn"].endswith("-22")
+
+    def test_an_explicit_end_date_overrides_the_derivation(self, tmp_path):
+        self._run(["cancel", "4", "--ends", "2026-09-08"], tmp_path)
+        assert self._marks(tmp_path)["4"]["endsOn"] == "2026-09-08"
+
+    def test_undo_removes_the_mark(self, tmp_path):
+        self._run(["cancel", "4", "--ends", "2026-09-08"], tmp_path)
+        self._run(["cancel", "4", "--undo"], tmp_path)
+        assert self._marks(tmp_path) == {}
+
+    def test_a_malformed_end_date_is_rejected(self, tmp_path, capsys):
+        with pytest.raises(SystemExit):
+            self._run(["cancel", "4", "--ends", "08.09.2026"], tmp_path)
+        assert "YYYY-MM-DD" in capsys.readouterr().err
+        assert self._marks(tmp_path) == {}
+
+    def test_a_config_without_a_monthly_date_asks_for_one(self, tmp_path, capsys):
+        # No guessing: an annual or invoiced plan has no monthly anniversary,
+        # and a wrong deadline is worse than none.
+        with pytest.raises(SystemExit):
+            self._run(
+                ["cancel", "4"],
+                tmp_path,
+                config=json.dumps({"oauthAccount": {"billingType": "invoiced"}}),
+            )
+        assert "--ends" in capsys.readouterr().err
+        assert self._marks(tmp_path) == {}
+
+    def test_bare_cancel_lists_marks_without_resolving_an_account(self, tmp_path, capsys):
+        self._run(["cancel", "4", "--ends", "2026-09-08"], tmp_path)
+        switcher = self._run(["cancel"], tmp_path)
+        out = capsys.readouterr().out
+        assert "d@example.com" in out and "2026-09-08" in out
+        switcher.resolve_account.assert_not_called()
+
+    def test_bare_cancel_on_a_clean_fleet_says_so(self, tmp_path, capsys):
+        self._run(["cancel"], tmp_path)
+        assert "No accounts are marked" in capsys.readouterr().out
+
+    def test_the_legacy_flag_forwards(self, tmp_path):
+        self._run(["--cancel-account", "4", "--ends", "2026-09-08"], tmp_path)
+        assert self._marks(tmp_path)["4"]["endsOn"] == "2026-09-08"
+
+    def test_translate_subcommand(self):
+        assert cli._translate_subcommand(["cancel"]) == ["--cancel-account"]
+        assert cli._translate_subcommand(["cancel", "4"]) == ["--cancel-account", "4"]
