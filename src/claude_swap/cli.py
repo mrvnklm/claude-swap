@@ -1053,6 +1053,14 @@ this machine: run the same command on each machine you use.
 
         cancellation.set_cancelled(backup_dir, key, ends_on, email=email)
         local_zone = datetime.now().astimezone().tzname() or "local time"
+        if switcher.is_account_disabled(str(account_num)):
+            # `disable` removes the slot from switchable_account_numbers(), so
+            # the engine never even considers it — the mark is recorded and
+            # inert for a reason the strategy note below cannot mention.
+            warning(
+                "  note: this account is disabled, so auto-switch will not "
+                "drain it. Re-enable it with: cswap enable " + str(account_num)
+            )
         print(f"{accent(email)}: marked as cancelled (slot {account_num})")
         print(f"  quota usable through {bolded(ends_on.isoformat())} ({local_zone})")
         _warn_if_marks_are_inert(switcher)

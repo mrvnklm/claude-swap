@@ -116,6 +116,37 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
+### Accounts you have cancelled
+
+A weekly window resets for as long as a subscription is live, so draining it a
+day late costs nothing. A cancelled subscription is different: whatever quota is
+left expires once, on a fixed date. Mark one and the `consume-first` strategy
+drains it before accounts whose quota merely resets.
+
+```bash
+cswap cancel 4 --ends 2026-09-08    # last day the quota is usable
+cswap cancel 4 --unset              # remove the mark
+cswap cancel                        # list marked accounts
+cswap cancel --prune                # drop marks whose account is gone
+```
+
+The date is given by hand because nothing can detect it: the usage API reports
+windows, not subscriptions, and the profile endpoint keeps reporting `active`
+for a subscription cancelled to run out its current period.
+
+Three things worth knowing:
+
+- **Marks are read by `consume-first` only.** The default strategy is `best`,
+  which ignores them — `cswap cancel` says so when that is the case.
+- **The date is read in this machine's local timezone**, and a mark whose day
+  has passed is ignored exactly as if it were absent.
+- **Marks are local to one machine.** They live in the auto-switch state file,
+  which deliberately never travels through `cswap export` — a cancellation is a
+  fact about your billing, not about the account. If you use the same accounts
+  on more than one machine, run `cswap cancel` on each. The mark itself is
+  stored per *account*, not per slot, so it stays correct even where the two
+  machines number that account differently.
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.

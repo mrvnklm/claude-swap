@@ -7092,6 +7092,28 @@ class TestCancelledAccountsDrainFirst:
         assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
+    def test_the_engine_resolves_a_mark_in_local_time(self, temp_home):
+        """The tz contract is pinned in the module; this pins it at the CALL.
+
+        `deadlines_by_slot` defaults to tz=None, which resolves the stated day
+        in the system zone — the zone the operator read the date in. Passing
+        tz=UTC from the engine would be green in the module's own tests and
+        wrong for anyone far from UTC, so the call site needs its own guard.
+        """
+        h = self._harness(temp_home)
+        seen: dict = {}
+        real = cancellation.deadlines_by_slot
+
+        def spy(state, identities, now, **kw):
+            seen.update(kw)
+            seen["called"] = True
+            return real(state, identities, now, **kw)
+
+        with patch.object(cancellation, "deadlines_by_slot", spy):
+            h.tick_with_usage(self._usage())
+        assert seen.get("called"), "the engine never resolved marks"
+        assert "tz" not in seen, "the engine must not override the local-time default"
+
     def test_the_lock_and_state_paths_match_the_engine(self, temp_home):
         """Kills the mutations that delete the CLI lock or point it elsewhere."""
         h = self._harness(temp_home)

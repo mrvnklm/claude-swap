@@ -1634,6 +1634,7 @@ class TestCancelCommand:
             switcher = switcher_cls.return_value
             switcher.backup_dir = tmp_path
             switcher.resolve_account.return_value = ("4", "d@example.com", None)
+            switcher.is_account_disabled.return_value = False
             switcher.account_identities.return_value = (
                 identities
                 if identities is not None
@@ -1789,6 +1790,26 @@ class TestCancelCommand:
         self._run(["cancel"], tmp_path)
         out = capsys.readouterr().out
         assert "lapsed" in out and "None" not in out
+
+    def test_marking_a_disabled_account_says_it_is_inert(self, tmp_path, capsys):
+        # `disable` removes the slot from switchable_account_numbers(), so the
+        # engine never considers it — a reason the strategy note cannot mention.
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.cli._guard_root"), \
+             patch.object(sys, "argv",
+                          ["claude-swap", "cancel", "4", "--ends", self._future()]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher = switcher_cls.return_value
+            switcher.backup_dir = tmp_path
+            switcher.resolve_account.return_value = ("4", "d@example.com", None)
+            switcher.account_identities.return_value = {
+                "4": {"uuid": "uuid-4", "organizationUuid": "org-4", "email": "d@e.f"}
+            }
+            switcher.is_account_disabled.return_value = True
+            cli.main()
+        out = capsys.readouterr().out
+        assert "disabled" in out and "cswap enable 4" in out
 
     def test_the_listing_never_prints_a_stray_none(self, tmp_path, capsys):
         # printer.warning() PRINTS and returns None; using it as a formatter
