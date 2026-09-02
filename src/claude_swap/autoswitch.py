@@ -45,6 +45,7 @@ from typing import ClassVar
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
+from claude_swap.cancellation import ends_at_ts, merge_deadline
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -1100,6 +1101,22 @@ class AutoSwitchEngine:
 
         consume_first = settings.strategy == "consume-first"
 
+        # A cancelled subscription's quota expires once, on a fixed date, so
+        # it outranks any weekly reset that falls after it. Resolved here,
+        # once per tick, from the state file this tick already read: the
+        # ranking is pure and is run twice by the consume-first two-phase
+        # commit, so it must not read state or look up emails itself. Only
+        # under consume-first — the mark is a statement about which quota is
+        # most perishable, which is the only question that strategy asks.
+        cancel_ends: dict[str, float | None] = (
+            {
+                num: ends_at_ts(state, num, self.switcher.account_email(num))
+                for num in (current, *oauth_candidates)
+            }
+            if consume_first
+            else {}
+        )
+
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
             the barred account is a different proposition from the one we left.
@@ -1184,6 +1201,7 @@ class AutoSwitchEngine:
             active_headroom=active_headroom,
             settings=settings,
             now=decided_now,
+            cancel_ends=cancel_ends,
         )
 
         if trigger == "consume-first" and ordered:
@@ -1215,6 +1233,7 @@ class AutoSwitchEngine:
                 active_headroom=active_headroom,
                 settings=settings,
                 now=decided_now,
+                cancel_ends=cancel_ends,
             )
 
         if not ordered and api_key_candidates and trigger != "consume-first":
@@ -1765,6 +1784,7 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        cancel_ends: dict[str, float | None] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -1775,8 +1795,11 @@ class AutoSwitchEngine:
         """
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
+        ends = cancel_ends or {}
         active_reset_ts = (
-            _seven_day_reset_ts(usage.get(current), now) if consume_first else None
+            merge_deadline(_seven_day_reset_ts(usage.get(current), now), ends.get(current))
+            if consume_first
+            else None
         )
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
@@ -1836,7 +1859,9 @@ class AutoSwitchEngine:
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                merge_deadline(_seven_day_reset_ts(usage.get(num), now), ends.get(num))
+                if consume_first
+                else None
             )
             recovery_ts = (
                 _binding_recovery_ts(usage.get(num), self._models, now)

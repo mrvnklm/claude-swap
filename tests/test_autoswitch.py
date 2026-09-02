@@ -6,12 +6,13 @@ import json
 import os
 import threading
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth, poll_policy
+from claude_swap import cancellation, oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
@@ -6894,3 +6895,98 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestCancelledAccountsDrainFirst:
+    """A cancelled subscription's quota expires once; a weekly reset does not.
+
+    So a marked account outranks every account whose only deadline is a reset
+    falling after the cancellation date, on the same consume-first axis.
+    """
+
+    # End-of-day UTC on the 3rd is before _R_SOON (the 5th, midnight).
+    ENDS_BEFORE_SOON = "2024-01-03"
+    ENDS_AFTER_LATEST = "2024-01-20"
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _mark(self, h: EngineHarness, number: str, email: str, ends_on: str) -> None:
+        cancellation.set_cancelled(
+            h.switcher.backup_dir, number, email, date.fromisoformat(ends_on)
+        )
+
+    def _usage(self) -> dict:
+        # #2 resets soonest of the three; #3 resets LATEST and has the most
+        # headroom, so only the cancellation can make it win.
+        return {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+
+    def test_a_cancelled_account_outranks_a_sooner_weekly_reset(self, temp_home):
+        h = self._harness(temp_home)
+        self._mark(h, "3", "c@example.com", self.ENDS_BEFORE_SOON)
+        outcome = h.tick_with_usage(self._usage())
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_without_the_mark_the_soonest_reset_still_wins(self, temp_home):
+        # The control. Same fleet, no mark -> the shipped behaviour, unchanged.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage(self._usage())
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_cancellation_after_every_reset_changes_nothing(self, temp_home):
+        # min(), not "the mark always wins": a reset that falls before the
+        # period end is still the nearer deadline and keeps its ordering.
+        h = self._harness(temp_home)
+        self._mark(h, "3", "c@example.com", self.ENDS_AFTER_LATEST)
+        outcome = h.tick_with_usage(self._usage())
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_mark_on_the_active_account_holds_it(self, temp_home):
+        # The active account's own deadline moves too, so once it is the
+        # soonest nothing qualifies and the engine stays and keeps burning it.
+        h = self._harness(temp_home)
+        self._mark(h, "1", "a@example.com", self.ENDS_BEFORE_SOON)
+        outcome = h.tick_with_usage(self._usage())
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_a_mark_for_a_different_email_is_ignored(self, temp_home):
+        # The slot was reassigned; the mark must not steer the new occupant.
+        h = self._harness(temp_home)
+        self._mark(h, "3", "someone-else@example.com", self.ENDS_BEFORE_SOON)
+        outcome = h.tick_with_usage(self._usage())
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_marks_are_ignored_under_the_best_strategy(self, temp_home):
+        # A cancellation says which quota is most perishable — a question only
+        # consume-first asks. `best` must rank on headroom exactly as before.
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark(h, "3", "c@example.com", self.ENDS_BEFORE_SOON)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),      # most headroom
+            "3": _usage7(60, 60, _R_LATEST),    # marked, but less headroom
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
