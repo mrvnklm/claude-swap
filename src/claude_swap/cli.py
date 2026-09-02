@@ -1169,6 +1169,126 @@ def _warn_if_marks_are_inert(switcher) -> None:
         )
 
 
+def _peers_command(argv: list[str]) -> None:
+    """Handle ``cswap peers [show|pull HOST...]``.
+
+    Two machines running the auto-switch engine against one pool of accounts
+    cannot see each other: every lock and state file lives under a per-machine
+    backup root. A claim closes that gap — but the engine must never fetch one
+    itself, because this package holds locks across decisions and holds none
+    across a network call. So the fetch is a command, run whenever the operator
+    likes (a login item, a cron line, by hand), and the engine only ever reads
+    what is already on disk.
+
+    ``show`` prints this machine's own claim, which is what ``pull`` runs on the
+    far side — so neither end has to know where the other keeps its files.
+    """
+    import subprocess
+
+    from claude_swap import host_claim
+
+    parser = argparse.ArgumentParser(
+        prog="cswap peers",
+        description=(
+            "Show or fetch the account claims other machines publish, so the "
+            "auto-switch engine here stops picking an account another machine "
+            "is already using."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap peers                       # what this machine knows about the others
+  cswap peers pull mac-studio       # fetch one machine's claim over ssh
+  cswap peers show                  # print this machine's own claim (used by pull)
+
+Claims carry an account identity, a timestamp and a session count — never a
+token or a credential. A peer that is unreachable or has gone quiet simply
+stops being counted, and every account becomes a candidate again.
+        """,
+    )
+    parser.add_argument("action", nargs="?", choices=("show", "pull"))
+    parser.add_argument("hosts", nargs="*", metavar="HOST")
+    parser.add_argument("--json", action="store_true", help="Machine-readable output")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.action != "pull" and args.hosts:
+        parser.error("HOST is only used with 'pull'")
+    if args.action == "pull" and not args.hosts:
+        parser.error("pull needs at least one HOST")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        backup_dir = switcher.backup_dir
+
+        if args.action == "show":
+            path = host_claim.claim_path(backup_dir)
+            if not path.exists():
+                error("No claim published yet — this machine has not switched.")
+                sys.exit(1)
+            print(path.read_text(encoding="utf-8").strip())
+            return
+
+        if args.action == "pull":
+            failures = 0
+            for host in args.hosts:
+                try:
+                    done = subprocess.run(
+                        ["ssh", host, "cswap peers show"],
+                        capture_output=True, text=True, timeout=20,
+                    )
+                except (OSError, subprocess.SubprocessError) as e:
+                    error(f"{host}: {e}")
+                    failures += 1
+                    continue
+                if done.returncode != 0:
+                    detail = (done.stderr or done.stdout or "").strip().splitlines()
+                    error(f"{host}: {detail[-1] if detail else 'ssh failed'}")
+                    failures += 1
+                    continue
+                if host_claim.write_peer_claim(backup_dir, host, done.stdout):
+                    print(f"{accent(host)}: claim updated")
+                else:
+                    error(f"{host}: did not return a usable claim")
+                    failures += 1
+            if failures:
+                sys.exit(1)
+            return
+
+        claims = host_claim.read_peers(backup_dir)
+        live = host_claim.claimed_keys(claims, exclude_host=host_claim.host_name())
+        if args.json:
+            print(json.dumps({
+                "schemaVersion": host_claim.SCHEMA_VERSION,
+                "peers": [
+                    {
+                        "host": c.host, "identityKey": c.key, "email": c.email,
+                        "ageSeconds": round(c.age_s, 1), "live": c.is_live(),
+                        "busySessions": c.busy_sessions,
+                    }
+                    for c in claims
+                ],
+            }, indent=2))
+            return
+        if not claims:
+            print(dimmed("No peer claims pulled yet"))
+            print(dimmed("  fetch one with: cswap peers pull <host>"))
+            return
+        print(bolded("Peer claims:"))
+        by_key = {c.key: c for c in live.values()}
+        for c in sorted(claims, key=lambda c: c.host):
+            held = "held" if c.key in by_key else muted("stale — not excluded")
+            org = c.key.rsplit(":", 1)[-1][:8]
+            print(f"  {c.host}: {c.email or '?'} · org {org} — {held}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1210,6 +1330,9 @@ def main() -> None:
     if argv and argv[0] == "cancel":
         _cancel_command(argv[1:])
         return
+    if argv and argv[0] == "peers":
+        _peers_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1245,6 +1368,7 @@ Commands:
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s cancel [<num|email>]       mark a cancelled account, or list marks
+  %(prog)s peers [pull <host>]       show or fetch other machines' account claims
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account

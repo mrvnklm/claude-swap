@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import cancellation, oauth, poll_policy
+from claude_swap import cancellation, host_claim, oauth, poll_policy
+from claude_swap.identity import identity_key
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
@@ -7124,3 +7125,95 @@ class TestCancelledAccountsDrainFirst:
             == h.engine._state_lock().lock_path
         )
 
+
+
+class TestPeerClaims:
+    """A peer machine's claim removes an account from consideration here."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="best")
+        for num, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(num, email)
+        data = h.switcher._get_sequence_data()
+        for num in ("1", "2", "3"):
+            data["accounts"][num]["organizationUuid"] = f"org-{num}"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        h.make_live("a@example.com", 1)
+        _add_org_to_live_config(h, "org-1")
+        return h
+
+    def _claim(self, h: EngineHarness, number: str, *, host="studio", age=60.0) -> None:
+        key = identity_key(h.switcher.account_identities()[number])
+        assert key is not None
+        now = h.clock.now
+        host_claim.write_peer_claim(h.switcher.backup_dir, host, json.dumps({
+            "schemaVersion": 1, "host": host, "identityKey": key,
+            "email": "x@y.z", "since": now - age, "publisherNow": now,
+            "busySessions": 2, "unreadableSessions": 0,
+        }))
+
+    # Active is over threshold, so the tick must move; #2 has the most headroom.
+    OVER = {
+        "1": _usage7(95, 20, _R_LATER),
+        "2": _usage7(5, 5, _R_LATER),      # most headroom -> the default pick
+        "3": _usage7(40, 40, _R_LATER),
+    }
+
+    def test_without_a_claim_the_best_account_wins(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_an_account_a_peer_holds_is_not_a_candidate(self, temp_home):
+        h = self._harness(temp_home)
+        self._claim(h, "2")
+        assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        assert h.active_number() == 3, "the engine took an account the peer holds"
+
+    def test_a_stale_claim_fails_open(self, temp_home):
+        # Targeting fails OPEN: a peer that went quiet must not keep an account
+        # excluded forever, or this machine parks on a shrinking pool.
+        h = self._harness(temp_home)
+        self._claim(h, "2", age=host_claim.CLAIM_TTL_S + 1)
+        assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_our_own_claim_never_excludes_us(self, temp_home):
+        # A synced rather than pulled directory would otherwise make a machine
+        # refuse the account it is itself using.
+        h = self._harness(temp_home)
+        self._claim(h, "2", host=host_claim.host_name())
+        assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_switch_publishes_a_claim_naming_the_new_account(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        record = json.loads(
+            host_claim.claim_path(h.switcher.backup_dir).read_text(encoding="utf-8")
+        )
+        assert record["identityKey"] == identity_key(
+            h.switcher.account_identities()["2"]
+        )
+        assert "slot" not in json.dumps(record).lower()
+
+    def test_a_published_claim_carries_no_credential_material(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self.OVER)
+        blob = host_claim.claim_path(h.switcher.backup_dir).read_text().lower()
+        for forbidden in ("token", "secret", "refresh", "bearer", "sk-"):
+            assert forbidden not in blob.replace("identitykey", "")
+
+    def test_a_dry_run_publishes_nothing(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        h.tick_with_usage(self.OVER)
+        assert not host_claim.claim_path(h.switcher.backup_dir).exists()
+
+    def test_an_unpublishable_claim_does_not_break_the_switch(self, temp_home):
+        # Publishing is a courtesy to the peer; a failure must never take down
+        # the switch that prompted it.
+        h = self._harness(temp_home)
+        with patch.object(host_claim, "publish", side_effect=OSError("nope")):
+            assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
