@@ -1615,8 +1615,8 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
 
 
-class TestCancelDispatch:
-    """`cswap cancel` — mark an account whose subscription is ending."""
+class TestCancelCommand:
+    """`cswap cancel` — its own pre-dispatch parser, like `alias` and `map`."""
 
     STRIPE_CONFIG = json.dumps({
         "oauthAccount": {
@@ -1625,8 +1625,13 @@ class TestCancelDispatch:
         }
     })
 
-    def _run(self, argv, tmp_path, *, config=STRIPE_CONFIG):
+    def _run(self, argv, tmp_path, *, config=STRIPE_CONFIG, strategy="best"):
+        from claude_swap.settings import AutoSwitchSettings
+
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.cli._guard_root"), \
+             patch("claude_swap.settings.load_settings",
+                   return_value=AutoSwitchSettings(strategy=strategy)), \
              patch.object(sys, "argv", ["claude-swap", *argv]), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
@@ -1646,16 +1651,15 @@ class TestCancelDispatch:
         self._run(["cancel", "4"], tmp_path)
         record = self._marks(tmp_path)["4"]
         assert record["email"] == "d@example.com"
-        # The 22nd of some month, derived rather than typed.
         assert record["endsOn"].endswith("-22")
 
     def test_an_explicit_end_date_overrides_the_derivation(self, tmp_path):
         self._run(["cancel", "4", "--ends", "2026-09-08"], tmp_path)
         assert self._marks(tmp_path)["4"]["endsOn"] == "2026-09-08"
 
-    def test_undo_removes_the_mark(self, tmp_path):
+    def test_unset_removes_the_mark(self, tmp_path):
         self._run(["cancel", "4", "--ends", "2026-09-08"], tmp_path)
-        self._run(["cancel", "4", "--undo"], tmp_path)
+        self._run(["cancel", "4", "--unset"], tmp_path)
         assert self._marks(tmp_path) == {}
 
     def test_a_malformed_end_date_is_rejected(self, tmp_path, capsys):
@@ -1665,19 +1669,27 @@ class TestCancelDispatch:
         assert self._marks(tmp_path) == {}
 
     def test_a_config_without_a_monthly_date_asks_for_one(self, tmp_path, capsys):
-        # No guessing: an annual or invoiced plan has no monthly anniversary,
-        # and a wrong deadline is worse than none.
         with pytest.raises(SystemExit):
             self._run(
-                ["cancel", "4"],
-                tmp_path,
+                ["cancel", "4"], tmp_path,
                 config=json.dumps({"oauthAccount": {"billingType": "invoiced"}}),
             )
         assert "--ends" in capsys.readouterr().err
         assert self._marks(tmp_path) == {}
 
+    def test_unset_with_ends_is_rejected(self, tmp_path, capsys):
+        with pytest.raises(SystemExit):
+            self._run(["cancel", "4", "--unset", "--ends", "2026-09-08"], tmp_path)
+        assert "--unset does not take --ends" in capsys.readouterr().err
+
+    def test_unset_without_an_account_is_rejected(self, tmp_path, capsys):
+        with pytest.raises(SystemExit):
+            self._run(["cancel", "--unset"], tmp_path)
+        assert "required with --unset" in capsys.readouterr().err
+
     def test_bare_cancel_lists_marks_without_resolving_an_account(self, tmp_path, capsys):
         self._run(["cancel", "4", "--ends", "2026-09-08"], tmp_path)
+        capsys.readouterr()
         switcher = self._run(["cancel"], tmp_path)
         out = capsys.readouterr().out
         assert "d@example.com" in out and "2026-09-08" in out
@@ -1687,10 +1699,35 @@ class TestCancelDispatch:
         self._run(["cancel"], tmp_path)
         assert "No accounts are marked" in capsys.readouterr().out
 
-    def test_the_legacy_flag_forwards(self, tmp_path):
-        self._run(["--cancel-account", "4", "--ends", "2026-09-08"], tmp_path)
-        assert self._marks(tmp_path)["4"]["endsOn"] == "2026-09-08"
+    def test_it_says_so_when_the_strategy_ignores_marks(self, tmp_path, capsys):
+        # The operator's actual default. Printing "auto-switch will drain this
+        # first" under `best` would be a plain untruth.
+        self._run(["cancel", "4"], tmp_path, strategy="best")
+        out = capsys.readouterr().out
+        assert "ignores" in out and "consume-first" in out
 
-    def test_translate_subcommand(self):
-        assert cli._translate_subcommand(["cancel"]) == ["--cancel-account"]
-        assert cli._translate_subcommand(["cancel", "4"]) == ["--cancel-account", "4"]
+    def test_it_stays_quiet_when_the_strategy_reads_marks(self, tmp_path, capsys):
+        self._run(["cancel", "4"], tmp_path, strategy="consume-first")
+        assert "ignores" not in capsys.readouterr().out
+
+
+class TestCancelDoesNotBreakExistingFlags:
+    """The new flags live in their own parser, so main-parser prefixes are
+    exactly as they are on the shipped CLI."""
+
+    def _err(self, argv):
+        with patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+    @pytest.mark.parametrize("flag", ["--u", "--en"])
+    def test_prefixes_that_worked_before_are_not_ambiguous(self, flag, capsys):
+        # --u -> --upgrade and --en -> --enable-account both resolve on main.
+        # Defining --ends/--undo on the MAIN parser made both ambiguous.
+        try:
+            self._err([flag])
+        except Exception:
+            pass
+        assert "ambiguous" not in capsys.readouterr().err
+

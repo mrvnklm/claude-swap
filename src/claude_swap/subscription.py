@@ -58,18 +58,19 @@ def next_period_start(created: datetime, now: datetime) -> datetime:
     ``created``; the exact hour is Stripe's business, and callers that only
     need the date should take ``.date()``.
     """
-    year, month = now.year, now.month
-    for _ in range(2):
-        day = min(created.day, calendar.monthrange(year, month)[1])
-        candidate = created.replace(year=year, month=month, day=day)
-        if candidate >= now:
-            return candidate
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-    # Unreachable: two iterations always straddle ``now``. Kept as a total
-    # function rather than an assert so a display path can never raise.
-    return created.replace(
-        year=year, month=month, day=min(created.day, calendar.monthrange(year, month)[1])
-    )
+    def anniversary(year: int, month: int) -> datetime:
+        # Clamp to the month length so a subscription created on the 31st
+        # renews on the 30th in November and the 28th in February, rather
+        # than raising ValueError on a display path.
+        return created.replace(
+            year=year, month=month, day=min(created.day, calendar.monthrange(year, month)[1])
+        )
+
+    this_month = anniversary(now.year, now.month)
+    if this_month >= now:
+        return this_month
+    year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+    return anniversary(year, month)
 
 
 def subscription_fields(config_text: str, now: datetime | None = None) -> dict | None:

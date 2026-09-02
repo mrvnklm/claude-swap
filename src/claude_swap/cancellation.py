@@ -164,7 +164,12 @@ def set_cancelled(
         record = {"email": email, "endsOn": ends_on.isoformat()}
         if note:
             record["note"] = note
-        state.setdefault(CANCELLED_KEY, {})[str(number)] = record
+        # Same non-dict guard the readers carry: a hand-edited or corrupt
+        # container must be replaced, not indexed into. `setdefault` alone
+        # returns the wrong type and the assignment then raises.
+        if not isinstance(state.get(CANCELLED_KEY), dict):
+            state[CANCELLED_KEY] = {}
+        state[CANCELLED_KEY][str(number)] = record
 
     return mutate_state(backup_dir, add)
 

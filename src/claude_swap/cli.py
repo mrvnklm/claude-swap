@@ -58,7 +58,6 @@ _SUBCOMMAND_FLAGS = {
     "rm": "--remove-account",
     "disable": "--disable-account",
     "enable": "--enable-account",
-    "cancel": "--cancel-account",
     "export": "--export",
     "import": "--import",
     "purge": "--purge",
@@ -916,72 +915,158 @@ def _use_native_tls() -> None:
         pass
 
 
-def _cancel_command(
-    switcher, identifier: str, ends: str | None, undo: bool
-) -> None:
-    """``cswap cancel`` — mark an account whose subscription is ending.
+def _cancel_command(argv: list[str]) -> None:
+    """Handle ``cswap cancel [NUM|EMAIL] [--ends DATE] [--unset]``.
 
-    A cancelled subscription's quota expires once, on a fixed date, so
-    consume-first should drain it before any account whose window merely
-    resets later. Nothing can detect this: the usage API reports windows, not
-    subscriptions, and the profile endpoint keeps saying "active" for a
-    subscription cancelled to run out its period. So the mark is manual, and
-    only the date is derived — from the account's own monthly anniversary.
+    Marks an account whose subscription is ending, so ``consume-first`` drains
+    it before accounts whose quota merely resets. Nothing can detect this: the
+    usage API reports windows, not subscriptions, and ``/api/oauth/profile``
+    keeps reporting ``active`` for a subscription cancelled to run out its
+    current period. Only the operator knows, so the mark is manual — but the
+    date is derived, from the account's own monthly anniversary.
+
+    Pre-dispatched with its own parser, like ``alias`` and ``map``: the main
+    parser's flags are prefix-matchable, and adding ``--ends``/``--unset``
+    there would make ``--en`` and ``--u`` ambiguous against the shipped
+    ``--enable-account`` and ``--upgrade``.
     """
     from datetime import date
 
     from claude_swap import cancellation
     from claude_swap.subscription import subscription_fields
 
-    backup_dir = switcher.backup_dir
+    parser = argparse.ArgumentParser(
+        prog="cswap cancel",
+        description=(
+            "Mark an account whose subscription is ending, so auto-switch "
+            "drains its remaining quota before quota that merely resets. "
+            "Marks are read by the 'consume-first' strategy only."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap cancel 4                      # end date from the billing anniversary
+  cswap cancel 4 --ends 2026-09-08    # state it explicitly
+  cswap cancel 4 --unset              # remove the mark
+  cswap cancel                        # list marked accounts
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to mark. Omit to list every mark.",
+    )
+    parser.add_argument(
+        "--ends",
+        metavar="YYYY-MM-DD",
+        help=(
+            "Last day this account's quota is usable. Defaults to the "
+            "account's own monthly billing anniversary."
+        ),
+    )
+    parser.add_argument(
+        "--unset", action="store_true", help="Remove the account's cancellation mark"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
 
-    if not identifier:
-        marks = cancellation.cancellations(cancellation.read_state(backup_dir))
-        if not marks:
-            print(dimmed("No accounts are marked as cancelled"))
+    if args.unset and args.ends:
+        parser.error("--unset does not take --ends")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        backup_dir = switcher.backup_dir
+
+        if args.account is None:
+            _print_cancellation_marks(switcher, backup_dir)
             return
-        print(bolded("Cancelled accounts:"))
-        for number in sorted(marks, key=lambda n: int(n) if n.isdigit() else 99):
-            record = marks[number]
-            email = record.get("email", "?")
-            print(f"  {number}: {email} — quota ends {record.get('endsOn', '?')}")
-        return
 
-    account_num, email, _ = switcher.resolve_account(identifier)
+        account_num, email, _ = switcher.resolve_account(args.account)
 
-    if undo:
-        if cancellation.clear_cancelled(backup_dir, account_num):
-            print(f"{accent(email)}: cancellation mark removed")
+        if args.unset:
+            if cancellation.clear_cancelled(backup_dir, account_num):
+                print(f"{accent(email)}: cancellation mark removed")
+            else:
+                print(dimmed(f"{email} was not marked as cancelled"))
+            return
+
+        if args.ends:
+            try:
+                ends_on = date.fromisoformat(args.ends)
+            except ValueError:
+                parser.error(f"--ends must be a YYYY-MM-DD date, got {args.ends!r}")
+            source = "given"
         else:
-            print(dimmed(f"{email} was not marked as cancelled"))
+            fields = subscription_fields(
+                switcher._read_account_config(account_num, email)
+            ) or {}
+            derived = fields.get("nextPeriodStart")
+            if not derived:
+                parser.error(
+                    f"cannot derive a period end for {email} — its stored config "
+                    "carries no monthly subscription date; pass one explicitly "
+                    "with --ends YYYY-MM-DD"
+                )
+            ends_on = date.fromisoformat(derived)
+            source = "billing anniversary"
+
+        cancellation.set_cancelled(backup_dir, account_num, email, ends_on)
+        print(f"{accent(email)}: marked as cancelled")
+        print(f"  quota ends {bolded(ends_on.isoformat())} ({source})")
+        _warn_if_marks_are_inert(switcher)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _print_cancellation_marks(switcher, backup_dir) -> None:
+    """List every mark, including one whose account has since gone away."""
+    from claude_swap import cancellation
+
+    marks = cancellation.cancellations(cancellation.read_state(backup_dir))
+    if not marks:
+        print(dimmed("No accounts are marked as cancelled"))
         return
+    print(bolded("Cancelled accounts:"))
+    for number in sorted(marks, key=lambda n: int(n) if n.isdigit() else 10**6):
+        record = marks[number]
+        stored_email = record.get("email", "?")
+        print(f"  {number}: {stored_email} — quota ends {record.get('endsOn', '?')}")
+    _warn_if_marks_are_inert(switcher)
 
-    if ends:
-        try:
-            ends_on = date.fromisoformat(ends)
-        except ValueError:
-            raise ValidationError(
-                f"--ends must be a YYYY-MM-DD date, got {ends!r}"
-            ) from None
-        source = "given"
-    else:
-        fields = subscription_fields(
-            switcher._read_account_config(account_num, email)
-        ) or {}
-        derived = fields.get("nextPeriodStart")
-        if not derived:
-            raise ConfigError(
-                f"Cannot derive a period end for {email} — its stored config "
-                "carries no monthly subscription date. Pass one explicitly: "
-                f"cswap cancel {identifier} --ends YYYY-MM-DD"
+
+def _warn_if_marks_are_inert(switcher) -> None:
+    """Say so when marks cannot affect anything under the current strategy.
+
+    Marks are read only by ``consume-first``. Printing "auto-switch will drain
+    this first" while the engine runs ``best`` would be a plain untruth, and
+    the default IS ``best``.
+    """
+    from claude_swap.settings import load_settings
+
+    try:
+        strategy = load_settings(switcher.backup_dir).strategy
+    except Exception:
+        return
+    if strategy != "consume-first":
+        print(
+            warning(
+                f"  note: autoswitch.strategy is '{strategy}', which ignores "
+                "cancellation marks."
             )
-        ends_on = date.fromisoformat(derived)
-        source = "billing anniversary"
-
-    cancellation.set_cancelled(backup_dir, account_num, email, ends_on)
-    print(f"{accent(email)}: marked as cancelled")
-    print(f"  quota ends {bolded(ends_on.isoformat())} ({source})")
-    print(dimmed("  auto-switch will drain this account before the others"))
+        )
+        print(
+            dimmed(
+                "  to act on them: cswap config set autoswitch.strategy consume-first"
+            )
+        )
 
 
 def main() -> None:
@@ -1021,6 +1106,9 @@ def main() -> None:
         return
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
+        return
+    if argv and argv[0] == "cancel":
+        _cancel_command(argv[1:])
         return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
@@ -1166,19 +1254,6 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Set a short display alias for the account (use with 'add')",
     )
     parser.add_argument(
-        "--ends",
-        metavar="YYYY-MM-DD",
-        help=(
-            "Last day this account's quota is usable (use with 'cancel'). "
-            "Defaults to the account's own monthly billing anniversary"
-        ),
-    )
-    parser.add_argument(
-        "--undo",
-        action="store_true",
-        help="Remove a cancellation mark (use with 'cancel')",
-    )
-    parser.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -1218,13 +1293,6 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     group.add_argument(
         "--enable-account",
         metavar="NUM|EMAIL",
-        help=argparse.SUPPRESS,
-    )
-    group.add_argument(
-        "--cancel-account",
-        metavar="NUM|EMAIL",
-        nargs="?",
-        const="",
         help=argparse.SUPPRESS,
     )
     group.add_argument(
@@ -1310,7 +1378,6 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.remove_account is not None
         or args.disable_account is not None
         or args.enable_account is not None
-        or args.cancel_account is not None
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
@@ -1399,8 +1466,6 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             switcher.set_account_disabled(args.disable_account, True)
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
-        elif args.cancel_account is not None:
-            _cancel_command(switcher, args.cancel_account, args.ends, args.undo)
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,

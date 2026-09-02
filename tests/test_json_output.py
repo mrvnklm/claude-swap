@@ -223,6 +223,74 @@ class TestListJson:
         assert acct1["usageStatus"] == "ok"
         assert acct1["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
 
+    def test_list_payload_includes_the_subscription_facts(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """The WIRING, not the helper.
+
+        subscription.py has its own unit tests, but without this one the whole
+        production seam — the call in _build_list_payload and the row key in
+        account_row — can be deleted with the suite still green.
+        """
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        switcher._write_account_config("1", "test@example.com", json.dumps({
+            "oauthAccount": {
+                "billingType": "stripe_subscription",
+                "organizationRateLimitTier": "default_claude_max_20x",
+                "subscriptionCreatedAt": "2025-12-22T07:01:44Z",
+            }
+        }))
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""):
+            payload = switcher.list_accounts(json_output=True)
+
+        acct1 = next(a for a in payload["accounts"] if a["number"] == 1)
+        assert acct1["subscription"]["billingType"] == "stripe_subscription"
+        assert acct1["subscription"]["rateLimitTier"] == "default_claude_max_20x"
+        assert acct1["subscription"]["nextPeriodStart"].endswith("-22")
+
+    def test_list_payload_omits_subscription_when_the_backup_has_none(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        switcher._write_account_config("1", "test@example.com", "{}")
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials("{}", False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""):
+            payload = switcher.list_accounts(json_output=True)
+
+        acct1 = next(a for a in payload["accounts"] if a["number"] == 1)
+        assert "subscription" not in acct1
+
+    def test_an_unreadable_config_yields_no_subscription_rather_than_raising(
+        self, temp_home: Path,
+    ):
+        """--json must stay a machine-readable envelope, not a traceback.
+
+        Scoped to the accessor rather than patching _read_account_config
+        globally: the shipped _account_is_switchable reads the same file on
+        the same path and has the same exposure, which is not this change's
+        to fix.
+        """
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        with patch.object(switcher, "_read_account_config",
+                          side_effect=OSError("permission denied")):
+            assert switcher._subscription_row_fields("1", "a@b.c") is None
+
     def test_list_payload_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,

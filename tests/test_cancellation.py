@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import date, datetime, timezone
 
 import pytest
@@ -174,3 +175,36 @@ class TestPersistence:
         assert cancellation.record_for(
             cancellation.read_state(tmp_path), "4", "a@b.c"
         ) is not None
+
+
+class TestLockIsActuallyTaken:
+    """The path-identity assertion in test_autoswitch proves the two sides
+    agree on WHICH lock. This proves the CLI writer actually takes it."""
+
+    def test_set_cancelled_waits_for_a_held_state_lock(self, tmp_path):
+        from claude_swap.locking import FileLock
+
+        started = threading.Event()
+        finished = threading.Event()
+
+        def mark():
+            started.set()
+            cancellation.set_cancelled(tmp_path, "4", "a@b.c", date(2026, 9, 8))
+            finished.set()
+
+        held = FileLock(tmp_path / cancellation.LOCK_FILENAME)
+        with held:
+            worker = threading.Thread(target=mark, daemon=True)
+            worker.start()
+            assert started.wait(5.0), "worker never ran"
+            # Generous enough not to flake, short enough to stay fast. With the
+            # `with _lock(...)` removed this write lands immediately and the
+            # assertion fails — which is the whole point of the test.
+            assert not finished.wait(0.75), (
+                "set_cancelled wrote while the state lock was held by someone else"
+            )
+        assert finished.wait(10.0), "set_cancelled never completed after release"
+        assert cancellation.record_for(
+            cancellation.read_state(tmp_path), "4", "a@b.c"
+        ) is not None
+

@@ -5327,6 +5327,20 @@ class ClaudeAccountSwitcher:
                 seen[key] = snum
         return out
 
+    def _subscription_row_fields(self, account_num: str, email: str) -> dict | None:
+        """Subscription facts for one list row, or None — never raising.
+
+        This is a display path that also serves ``--json``, where an escaping
+        OSError would replace the machine-readable envelope with a traceback.
+        A backup that exists but cannot be read is exactly "no information",
+        which is what the row already renders when the key is absent.
+        """
+        try:
+            config_text = self._read_account_config(account_num, email)
+        except OSError:
+            return None
+        return subscription_fields(config_text)
+
     def _build_list_payload(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -5353,9 +5367,7 @@ class ClaudeAccountSwitcher:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
-                    subscription=subscription_fields(
-                        self._read_account_config(str(num), email)
-                    ),
+                    subscription=self._subscription_row_fields(str(num), email),
                 )
             )
         payload = {

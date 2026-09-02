@@ -6990,3 +6990,45 @@ class TestCancelledAccountsDrainFirst:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    # The fleet shape that pins PHASE 1 of the two-phase commit: the active
+    # resets soonest, so without a mark no candidate qualifies at all and
+    # phase 2 — which only runs on a non-empty phase-1 list — never happens.
+    ACTIVE_RESETS_SOONEST = {
+        "1": _usage7(20, 20, _R_SOON),
+        "2": _usage7(10, 10, _R_LATER),
+        "3": _usage7(10, 10, _R_LATEST),
+    }
+
+    def test_nothing_qualifies_when_the_active_resets_soonest(self, temp_home):
+        # Control for the test below: shipped behaviour, no mark.
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self.ACTIVE_RESETS_SOONEST) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_a_mark_alone_can_make_a_candidate_qualify(self, temp_home):
+        """Kills the mutation that drops cancel_ends from the FIRST _rank call.
+
+        On this fleet the mark is the ONLY thing that puts anything in phase
+        1's list, so a phase-1 regression shows up as no switch at all rather
+        than as a differently-ordered one.
+        """
+        h = self._harness(temp_home)
+        self._mark(h, "3", "c@example.com", self.ENDS_BEFORE_SOON)
+        assert h.tick_with_usage(self.ACTIVE_RESETS_SOONEST) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_the_lock_and_state_paths_match_the_engine(self, temp_home):
+        """Kills the mutations that delete the CLI lock or point it elsewhere.
+
+        cancellation.py restates the state filename and lock name as its own
+        literals; nothing but this test stops a rename on either side from
+        silently un-serialising a `cswap cancel` against a running engine.
+        """
+        h = self._harness(temp_home)
+        backup_dir = h.switcher.backup_dir
+        assert cancellation.state_path(backup_dir) == h.engine.state_path
+        assert (
+            cancellation._lock(backup_dir).lock_path
+            == h.engine._state_lock().lock_path
+        )
