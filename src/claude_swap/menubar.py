@@ -29,7 +29,10 @@ from pathlib import Path
 
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.paths import get_backup_root
 from claude_swap.switcher import SENTINEL_NOTES
+
+_logger = logging.getLogger("claude-swap")
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -315,7 +318,12 @@ def _in_switch_order(accounts: list, settings) -> list:
         active = [r for r in accounts if r[2]]
         disabled = [r for r in accounts if r[6] and not r[2]]
         return active + [by_num[n] for n in ordered] + disabled
-    except Exception:  # pragma: no cover - never break the menu
+    except Exception:
+        # The menu must still draw — but a silent fallback hid a plain
+        # NameError here once (a missing import), and the list quietly stayed
+        # in slot order while every other check said the new build was live.
+        # Log it, so the next one is findable instead of invisible.
+        _logger.warning("could not order accounts by switch order", exc_info=True)
         return list(accounts)
 
 

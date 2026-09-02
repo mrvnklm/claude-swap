@@ -901,3 +901,64 @@ def test_attributed_row_count_and_no_crash_on_sentinel_and_disabled():
         )
         assert len(titles) == 3
         assert "re-login needed" in titles[1].string()
+
+
+def _row(num, email, *, active=False, disabled=False, usage=None):
+    """A menu row in the shape the menu bar builds them."""
+    return (num, email, active, usage, usage, "", disabled, None)
+
+
+def _seven(pct5, pct7, reset7=None):
+    seven = {"pct": pct7}
+    if reset7:
+        seven["resets_at"] = reset7
+    return {"five_hour": {"pct": pct5}, "seven_day": seven}
+
+
+class TestMenuInSwitchOrder:
+    """The menu must list accounts in the order the engine would reach for.
+
+    Written after the real failure: `_in_switch_order` used `get_backup_root`
+    without importing it, the NameError was swallowed by its own safety net,
+    and the menu silently kept slot order while every other check said the new
+    build was live. These assert the reordering ACTUALLY HAPPENS, which is the
+    only thing that would have caught it.
+    """
+
+    ROWS = [
+        _row("1", "a@x", usage=_seven(5, 5, "2026-01-10T00:00:00Z")),
+        _row("2", "b@x", usage=_seven(5, 5, "2026-01-05T00:00:00Z")),
+        _row("6", "c@x", active=True, usage=_seven(50, 50)),
+        _row("9", "d@x", disabled=True, usage=_seven(1, 1)),
+    ]
+
+    def test_the_active_account_comes_first(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(menubar, "get_backup_root", lambda: tmp_path)
+        out = menubar._in_switch_order(self.ROWS, menubar.MenuBarSettings())
+        assert out[0][0] == "6"
+
+    def test_disabled_accounts_come_last(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(menubar, "get_backup_root", lambda: tmp_path)
+        out = menubar._in_switch_order(self.ROWS, menubar.MenuBarSettings())
+        assert out[-1][0] == "9"
+
+    def test_it_does_not_simply_return_the_input(self, tmp_path, monkeypatch):
+        # The exact regression: a swallowed error returned the list unchanged
+        # and nothing noticed.
+        monkeypatch.setattr(menubar, "get_backup_root", lambda: tmp_path)
+        out = menubar._in_switch_order(self.ROWS, menubar.MenuBarSettings())
+        assert [r[0] for r in out] != [r[0] for r in self.ROWS]
+
+    def test_every_row_survives_the_reordering(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(menubar, "get_backup_root", lambda: tmp_path)
+        out = menubar._in_switch_order(self.ROWS, menubar.MenuBarSettings())
+        assert sorted(r[0] for r in out) == sorted(r[0] for r in self.ROWS)
+
+    def test_a_failure_leaves_the_menu_drawable_and_says_so(self, tmp_path, monkeypatch, caplog):
+        # The safety net stays — a menu that will not draw is worse than one
+        # in the wrong order — but it must no longer be silent.
+        monkeypatch.setattr(menubar, "get_backup_root", lambda: 1 / 0)
+        with caplog.at_level("WARNING"):
+            out = menubar._in_switch_order(self.ROWS, menubar.MenuBarSettings())
+        assert [r[0] for r in out] == [r[0] for r in self.ROWS]
+        assert "switch order" in caplog.text
