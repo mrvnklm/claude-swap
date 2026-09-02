@@ -6897,6 +6897,20 @@ class TestFreshenRoutesThroughGate:
 
 
 
+def _add_org_to_live_config(h: EngineHarness, org: str) -> None:
+    """Give the live login the organization its roster entry now carries.
+
+    The shared `make_live` writes an oauthAccount with no organizationUuid,
+    which is fine while the roster has none either — but these tests need real
+    organizations to key marks by, and the active-account resolution matches
+    on them.
+    """
+    path = h.temp_home / ".claude.json"
+    config = json.loads(path.read_text())
+    config["oauthAccount"]["organizationUuid"] = org
+    path.write_text(json.dumps(config))
+
+
 class TestCancelledAccountsDrainFirst:
     """A cancelled subscription's quota expires once; a weekly reset does not.
 
@@ -6904,26 +6918,41 @@ class TestCancelledAccountsDrainFirst:
     falling after the cancellation date, on the same consume-first axis.
     """
 
-    # End-of-day UTC on the 3rd is before _R_SOON (the 5th, midnight).
+    # End-of-day on the 3rd (2024) precedes _R_SOON, which is the 5th.
     ENDS_BEFORE_SOON = "2024-01-03"
     ENDS_AFTER_LATEST = "2024-01-20"
+    # FakeClock starts at epoch 1_000_000 = 1970-01-12, so "already past"
+    # has to precede that, not today.
+    LAPSED = "1970-01-05"
 
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
-        h.seed(1, "a@example.com")
-        h.seed(2, "b@example.com")
-        h.seed(3, "c@example.com")
+        for num, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(num, email)
+        # The shared seed leaves organizationUuid empty, and a mark is keyed by
+        # (uuid, organizationUuid) — give each slot a distinct org so the marks
+        # in these tests can resolve at all.
+        data = h.switcher._get_sequence_data()
+        for num in ("1", "2", "3"):
+            data["accounts"][num]["organizationUuid"] = f"org-{num}"
+        h.switcher._write_json(h.switcher.sequence_file, data)
         h.make_live("a@example.com", 1)
+        _add_org_to_live_config(h, "org-1")
         return h
 
-    def _mark(self, h: EngineHarness, number: str, email: str, ends_on: str) -> None:
+    def _key(self, h: EngineHarness, number: str) -> str:
+        key = cancellation.identity_key(h.switcher.account_identities()[number])
+        assert key is not None, "test fleet must carry a keyable identity"
+        return key
+
+    def _mark(self, h: EngineHarness, number: str, ends_on: str) -> None:
         cancellation.set_cancelled(
-            h.switcher.backup_dir, number, email, date.fromisoformat(ends_on)
+            h.switcher.backup_dir, self._key(h, number), date.fromisoformat(ends_on)
         )
 
     def _usage(self) -> dict:
         # #2 resets soonest of the three; #3 resets LATEST and has the most
-        # headroom, so only the cancellation can make it win.
+        # headroom, so only a cancellation can make it win.
         return {
             "1": _usage7(20, 20, _R_LATER),
             "2": _usage7(10, 10, _R_SOON),
@@ -6932,63 +6961,84 @@ class TestCancelledAccountsDrainFirst:
 
     def test_a_cancelled_account_outranks_a_sooner_weekly_reset(self, temp_home):
         h = self._harness(temp_home)
-        self._mark(h, "3", "c@example.com", self.ENDS_BEFORE_SOON)
-        outcome = h.tick_with_usage(self._usage())
-        assert outcome is TickOutcome.SWITCHED
+        self._mark(h, "3", self.ENDS_BEFORE_SOON)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
         assert h.active_number() == 3
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
 
     def test_without_the_mark_the_soonest_reset_still_wins(self, temp_home):
-        # The control. Same fleet, no mark -> the shipped behaviour, unchanged.
         h = self._harness(temp_home)
-        outcome = h.tick_with_usage(self._usage())
-        assert outcome is TickOutcome.SWITCHED
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
     def test_a_cancellation_after_every_reset_changes_nothing(self, temp_home):
-        # min(), not "the mark always wins": a reset that falls before the
-        # period end is still the nearer deadline and keeps its ordering.
         h = self._harness(temp_home)
-        self._mark(h, "3", "c@example.com", self.ENDS_AFTER_LATEST)
-        outcome = h.tick_with_usage(self._usage())
-        assert outcome is TickOutcome.SWITCHED
+        self._mark(h, "3", self.ENDS_AFTER_LATEST)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
     def test_a_mark_on_the_active_account_holds_it(self, temp_home):
-        # The active account's own deadline moves too, so once it is the
-        # soonest nothing qualifies and the engine stays and keeps burning it.
         h = self._harness(temp_home)
-        self._mark(h, "1", "a@example.com", self.ENDS_BEFORE_SOON)
-        outcome = h.tick_with_usage(self._usage())
-        assert outcome is TickOutcome.NO_ACTION
+        self._mark(h, "1", self.ENDS_BEFORE_SOON)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
-        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["already-consuming-soonest"]
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "already-consuming-soonest"
+        ]
 
-    def test_a_mark_for_a_different_email_is_ignored(self, temp_home):
-        # The slot was reassigned; the mark must not steer the new occupant.
+    def test_a_lapsed_mark_on_a_candidate_is_ignored(self, temp_home):
+        # THE BLOCKER. Ranked as a real instant, a lapsed mark won the sort and
+        # then pinned the fleet to the dead account tick after tick.
         h = self._harness(temp_home)
-        self._mark(h, "3", "someone-else@example.com", self.ENDS_BEFORE_SOON)
-        outcome = h.tick_with_usage(self._usage())
-        assert outcome is TickOutcome.SWITCHED
+        self._mark(h, "3", self.LAPSED)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert h.active_number() == 2  # the genuinely soonest reset, not the mark
+
+    def test_a_lapsed_mark_on_the_active_account_does_not_pin_the_fleet(self, temp_home):
+        # The half no sentinel could rescue: the active slot never enters the
+        # candidate loop, so only the lapse rule can free it.
+        h = self._harness(temp_home)
+        self._mark(h, "1", self.LAPSED)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_a_mark_for_an_account_no_longer_in_the_slot_is_ignored(self, temp_home):
+        # Keyed by identity: a mark cannot follow a slot number onto whatever
+        # moved in later.
+        h = self._harness(temp_home)
+        cancellation.set_cancelled(
+            h.switcher.backup_dir, "someone:else", date.fromisoformat(self.ENDS_BEFORE_SOON)
+        )
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_two_slots_sharing_an_account_are_marked_independently(self, temp_home):
+        # The operator's real shape: one account, two organizations, two slots.
+        h = self._harness(temp_home)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["uuid"] = data["accounts"]["2"]["uuid"]
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        self._mark(h, "3", self.ENDS_BEFORE_SOON)
+        assert h.tick_with_usage(self._usage()) is TickOutcome.SWITCHED
+        assert h.active_number() == 3  # only slot 3's org was marked
+
     def test_marks_are_ignored_under_the_best_strategy(self, temp_home):
-        # A cancellation says which quota is most perishable — a question only
-        # consume-first asks. `best` must rank on headroom exactly as before.
         h = EngineHarness(temp_home, strategy="best")
-        h.seed(1, "a@example.com")
-        h.seed(2, "b@example.com")
-        h.seed(3, "c@example.com")
+        for num, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(num, email)
+        data = h.switcher._get_sequence_data()
+        for num in ("1", "2", "3"):
+            data["accounts"][num]["organizationUuid"] = f"org-{num}"
+        h.switcher._write_json(h.switcher.sequence_file, data)
         h.make_live("a@example.com", 1)
-        self._mark(h, "3", "c@example.com", self.ENDS_BEFORE_SOON)
-        outcome = h.tick_with_usage({
+        _add_org_to_live_config(h, "org-1")
+        self._mark(h, "3", self.ENDS_BEFORE_SOON)
+        assert h.tick_with_usage({
             "1": _usage7(95, 20, _R_LATER),
             "2": _usage7(10, 10, _R_SOON),      # most headroom
             "3": _usage7(60, 60, _R_LATEST),    # marked, but less headroom
-        })
-        assert outcome is TickOutcome.SWITCHED
+        }) is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
     # The fleet shape that pins PHASE 1 of the two-phase commit: the active
@@ -7001,30 +7051,19 @@ class TestCancelledAccountsDrainFirst:
     }
 
     def test_nothing_qualifies_when_the_active_resets_soonest(self, temp_home):
-        # Control for the test below: shipped behaviour, no mark.
         h = self._harness(temp_home)
         assert h.tick_with_usage(self.ACTIVE_RESETS_SOONEST) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
     def test_a_mark_alone_can_make_a_candidate_qualify(self, temp_home):
-        """Kills the mutation that drops cancel_ends from the FIRST _rank call.
-
-        On this fleet the mark is the ONLY thing that puts anything in phase
-        1's list, so a phase-1 regression shows up as no switch at all rather
-        than as a differently-ordered one.
-        """
+        """Kills the mutation that drops cancel_ends from the FIRST _rank call."""
         h = self._harness(temp_home)
-        self._mark(h, "3", "c@example.com", self.ENDS_BEFORE_SOON)
+        self._mark(h, "3", self.ENDS_BEFORE_SOON)
         assert h.tick_with_usage(self.ACTIVE_RESETS_SOONEST) is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
     def test_the_lock_and_state_paths_match_the_engine(self, temp_home):
-        """Kills the mutations that delete the CLI lock or point it elsewhere.
-
-        cancellation.py restates the state filename and lock name as its own
-        literals; nothing but this test stops a rename on either side from
-        silently un-serialising a `cswap cancel` against a running engine.
-        """
+        """Kills the mutations that delete the CLI lock or point it elsewhere."""
         h = self._harness(temp_home)
         backup_dir = h.switcher.backup_dir
         assert cancellation.state_path(backup_dir) == h.engine.state_path
@@ -7032,3 +7071,4 @@ class TestCancelledAccountsDrainFirst:
             cancellation._lock(backup_dir).lock_path
             == h.engine._state_lock().lock_path
         )
+

@@ -45,7 +45,8 @@ from typing import ClassVar
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
-from claude_swap.cancellation import ends_at_ts, merge_deadline
+from claude_swap import cancellation
+from claude_swap.cancellation import merge_deadline
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -1101,21 +1102,6 @@ class AutoSwitchEngine:
 
         consume_first = settings.strategy == "consume-first"
 
-        # A cancelled subscription's quota expires once, on a fixed date, so
-        # it outranks any weekly reset that falls after it. Resolved here,
-        # once per tick, from the state file this tick already read: the
-        # ranking is pure and is run twice by the consume-first two-phase
-        # commit, so it must not read state or look up emails itself. Only
-        # under consume-first — the mark is a statement about which quota is
-        # most perishable, which is the only question that strategy asks.
-        cancel_ends: dict[str, float | None] = (
-            {
-                num: ends_at_ts(state, num, self.switcher.account_email(num))
-                for num in (current, *oauth_candidates)
-            }
-            if consume_first
-            else {}
-        )
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1191,6 +1177,25 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
+        # A cancelled subscription's quota expires once, on a fixed date, so it
+        # outranks any weekly reset falling after it. Resolved here, once, from
+        # the state this tick already read and against `decided_now`, so the
+        # lapse rule and the ranking share one clock. Reused verbatim for the
+        # phase-2 re-rank: what a mark says cannot change inside a tick, and
+        # re-resolving would let the two rankings disagree.
+        #
+        # The `consume_first` gate here is an OPTIMISATION, not a guard: it
+        # skips a roster read and a resolve pass for the strategies that will
+        # not look. Correctness lives inside `_rank_candidates`, which reads
+        # `ends` only from its own consume-first branches — so deleting this
+        # gate changes nothing observable, and no test can kill it.
+        cancel_ends: dict[str, float] = (
+            cancellation.deadlines_by_slot(
+                state, self.switcher.account_identities(), decided_now
+            )
+            if consume_first
+            else {}
+        )
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,

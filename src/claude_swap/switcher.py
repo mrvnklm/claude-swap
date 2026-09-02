@@ -85,7 +85,6 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
-from claude_swap.subscription import subscription_fields
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -1968,6 +1967,22 @@ class ClaudeAccountSwitcher:
             "email": acct.get("email", ""),
             "organizationUuid": acct.get("organizationUuid", "") or "",
             "uuid": (acct.get("uuid") or "").strip(),
+        }
+
+    def account_identities(self) -> dict[str, dict]:
+        """Every managed slot's stored identity, from one sequence read.
+
+        ``account_identity`` re-reads the sequence file per call, which is fine
+        for a single lookup and wasteful for a whole-fleet pass on a hot path.
+        """
+        data = self._get_sequence_data() or {}
+        return {
+            str(num): {
+                "email": acct.get("email", ""),
+                "organizationUuid": acct.get("organizationUuid", "") or "",
+                "uuid": (acct.get("uuid") or "").strip(),
+            }
+            for num, acct in (data.get("accounts") or {}).items()
         }
 
     def backfill_account_uuid(
@@ -5327,20 +5342,6 @@ class ClaudeAccountSwitcher:
                 seen[key] = snum
         return out
 
-    def _subscription_row_fields(self, account_num: str, email: str) -> dict | None:
-        """Subscription facts for one list row, or None — never raising.
-
-        This is a display path that also serves ``--json``, where an escaping
-        OSError would replace the machine-readable envelope with a traceback.
-        A backup that exists but cannot be read is exactly "no information",
-        which is what the row already renders when the key is absent.
-        """
-        try:
-            config_text = self._read_account_config(account_num, email)
-        except OSError:
-            return None
-        return subscription_fields(config_text)
-
     def _build_list_payload(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -5367,7 +5368,6 @@ class ClaudeAccountSwitcher:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
-                    subscription=self._subscription_row_fields(str(num), email),
                 )
             )
         payload = {

@@ -221,7 +221,6 @@ def account_row(
     last_good_usage: dict | None = None,
     alias: str = "",
     disabled: bool = False,
-    subscription: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
@@ -241,12 +240,6 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
-    # Additive field: the subscription facts the stored config already carried
-    # (billing type, tier, and for a monthly plan the next period boundary).
-    # Absent when the backup holds none, so a consumer can tell "this account
-    # has no such record" from "the record says nothing".
-    if subscription:
-        row["subscription"] = subscription
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
