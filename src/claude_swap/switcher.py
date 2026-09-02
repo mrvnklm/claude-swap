@@ -85,6 +85,7 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.subscription import subscription_fields
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -5352,6 +5353,9 @@ class ClaudeAccountSwitcher:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    subscription=subscription_fields(
+                        self._read_account_config(str(num), email)
+                    ),
                 )
             )
         payload = {
