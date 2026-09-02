@@ -104,6 +104,11 @@ class MenuBarSettings:
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
+    # The menu bar is the scarcest screen real estate there is. Dropping the
+    # icon buys back three characters for someone running a full bar; the
+    # title still falls back to it when there is nothing else to show, or the
+    # item would have no clickable label at all.
+    show_icon: bool = True
     refresh_interval: int = 60
     # On by default: the menu bar exists to keep switching hands-off, and a
     # status item that watches an account burn without acting is the state
@@ -894,8 +899,11 @@ def format_title(
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
     if not segments:
+        # Never return an empty title: an item with no label is an invisible,
+        # unclickable gap in the menu bar.
         return ICON
-    return f"{ICON} " + " · ".join(segments)
+    body = " · ".join(segments)
+    return f"{ICON} {body}" if settings.show_icon else body
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
@@ -1395,6 +1403,12 @@ def run(switcher) -> int:
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
 
+            icon_item = rumps.MenuItem(
+                "Show icon in title", callback=self.on_toggle_icon
+            )
+            icon_item.state = 1 if self.settings.show_icon else 0
+            menu.add(icon_item)
+
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
             for secs in REFRESH_CHOICES:
@@ -1547,6 +1561,10 @@ def run(switcher) -> int:
 
         def on_toggle_scoped(self, _sender):
             self.settings.title_scoped = not self.settings.title_scoped
+            self._save_and_rebuild()
+
+        def on_toggle_icon(self, _sender):
+            self.settings.show_icon = not self.settings.show_icon
             self._save_and_rebuild()
 
         def on_toggle_resets(self, _sender):

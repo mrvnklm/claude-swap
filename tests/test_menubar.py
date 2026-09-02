@@ -962,3 +962,39 @@ class TestMenuInSwitchOrder:
             out = menubar._in_switch_order(self.ROWS, menubar.MenuBarSettings())
         assert [r[0] for r in out] == [r[0] for r in self.ROWS]
         assert "switch order" in caplog.text
+
+
+class TestTitleWithoutIcon:
+    """The menu bar is the scarcest screen real estate there is."""
+
+    USAGE = {"five_hour": {"pct": 43.0}, "seven_day": {"pct": 92.0}}
+
+    def _title(self, **kw):
+        return menubar.format_title(
+            "claude@a11yplan.de", self.USAGE, menubar.MenuBarSettings(**kw)
+        )
+
+    def test_the_icon_is_there_by_default(self):
+        assert self._title().startswith(menubar.ICON)
+
+    def test_dropping_the_icon_drops_it(self):
+        assert self._title(show_icon=False) == "claude · 43% · 92%"
+
+    def test_the_shortest_useful_title_is_just_the_session_pct(self):
+        title = self._title(show_icon=False, show_account_name=False, title_pct="5h")
+        assert title == "43%"
+
+    def test_an_empty_title_still_falls_back_to_the_icon(self):
+        # A menu bar item with no label is an invisible, unclickable gap.
+        title = self._title(show_icon=False, show_account_name=False, title_pct="off")
+        assert title == menubar.ICON
+
+    def test_no_account_still_shows_the_icon(self):
+        assert menubar.format_title(
+            None, None, menubar.MenuBarSettings(show_icon=False)
+        ) == menubar.ICON
+
+    def test_the_setting_round_trips(self, tmp_path):
+        path = tmp_path / "menubar_settings.json"
+        menubar.MenuBarSettings(show_icon=False).save(path)
+        assert menubar.MenuBarSettings.load(path).show_icon is False
