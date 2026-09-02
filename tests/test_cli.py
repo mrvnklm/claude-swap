@@ -1948,10 +1948,15 @@ class TestCancelDoesNotBreakExistingFlags:
     """The new flags live in their own parser, so main-parser prefixes are
     exactly as they are on the shipped CLI."""
 
-    @pytest.mark.parametrize("flag", ["--u", "--en"])
+    @pytest.mark.parametrize("flag", ["--en"])
     def test_prefixes_that_worked_before_are_not_ambiguous(self, flag, capsys):
-        # --u -> --upgrade and --en -> --enable-account both resolve on main.
-        # Defining --ends/--unset on the MAIN parser made both ambiguous.
+        # --en -> --enable-account resolves on main; defining --ends on the
+        # MAIN parser made it ambiguous, which is what this pins.
+        #
+        # --u is deliberately NOT tested: it resolved to --upgrade until
+        # --uninstall-service landed upstream, and is ambiguous on plain main
+        # today. Asserting it here would fail for a reason that has nothing to
+        # do with this change.
         with patch.object(sys, "argv", ["claude-swap", flag]), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             with pytest.raises(SystemExit):
