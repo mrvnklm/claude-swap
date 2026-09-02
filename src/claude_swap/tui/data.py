@@ -12,6 +12,8 @@ must be called from a thread worker, never the UI event loop.
 
 from __future__ import annotations
 
+from claude_swap.settings import parse_model_names
+
 import contextlib
 import io
 import sys
@@ -192,3 +194,37 @@ __all__ = [
     "window_pct",
     "window_reset_text",
 ]
+
+
+def in_switch_order(accounts: list, settings, now: float) -> list:
+    """Accounts reordered the way the engine would reach for them.
+
+    The active account stays first — it is where you are, not somewhere you
+    might go — and everything else follows the configured strategy's own
+    preference. Both come from `autoswitch.preference_order`, so a list can
+    never contradict the switch that follows it, which is exactly what the
+    auto screen used to do: it sorted by utilization while its comment claimed
+    to match the engine.
+
+    Accounts held out of rotation sort to the end. They are still valid
+    explicit targets, so they are shown rather than hidden — just not offered
+    as the next step.
+    """
+    from claude_swap.autoswitch import preference_order
+
+    by_number = {acc.number: acc for acc in accounts}
+    usage = {
+        acc.number: acc.usage.decision_value()
+        for acc in accounts
+        if not acc.is_active and not acc.disabled
+    }
+    models = parse_model_names(settings.model)
+    ordered = preference_order(
+        usage,
+        models=models,
+        consume_first=settings.strategy == "consume-first",
+        now=now,
+    )
+    active = [a for a in accounts if a.is_active]
+    disabled = [a for a in accounts if a.disabled and not a.is_active]
+    return active + [by_number[n] for n in ordered] + disabled

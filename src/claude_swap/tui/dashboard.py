@@ -17,6 +17,8 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
+import time
+
 from functools import partial
 from typing import TYPE_CHECKING, Callable
 
@@ -234,16 +236,21 @@ class AccountListScreen(Screen):
     def on_mount(self) -> None:
         self.watch(self.app, "snapshot", self._on_snapshot)
 
+    def _ordered(self, snap: AccountsSnapshot) -> list:
+        """The order to render. Sequence order unless a screen says otherwise."""
+        return list(snap.accounts)
+
     async def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
         if snap is None:
             return
         listview = self.query_one("#accounts", ListView)
-        numbers = [acc.number for acc in snap.accounts]
+        rows = self._ordered(snap)
+        numbers = [acc.number for acc in rows]
         if numbers != self._numbers:
             first_build = not self._numbers
             previous = listview.index
             await listview.clear()
-            await listview.extend(AccountItem(acc) for acc in snap.accounts)
+            await listview.extend(AccountItem(acc) for acc in rows)
             self._numbers = numbers
             listview.index = (
                 self._index_after_build(snap, first_build, previous)
@@ -251,7 +258,7 @@ class AccountListScreen(Screen):
                 else None
             )
         else:
-            for item, acc in zip(listview.query(AccountItem), snap.accounts):
+            for item, acc in zip(listview.query(AccountItem), rows):
                 item.set_account(acc)
         self._flash_updated(snap, listview)
 
@@ -348,6 +355,24 @@ class WatchScreen(AccountListScreen):
         Binding("down,j", "nav_down", show=False),
         Binding("up,k", "nav_up", show=False),
     ]
+
+    def _ordered(self, snap: AccountsSnapshot) -> list:
+        """Rendered in the order the engine would reach for them.
+
+        The point of watching is to see what happens next, and sequence order
+        says nothing about that. The active account stays on top; the rest
+        follow the configured strategy's own preference, from the same key the
+        engine ranks by — so the list cannot contradict the switch that
+        follows it.
+        """
+        from claude_swap.settings import load_settings
+        from claude_swap.tui import data
+
+        try:
+            settings = load_settings(self.app.switcher.backup_dir)
+            return data.in_switch_order(list(snap.accounts), settings, time.time())
+        except Exception:  # pragma: no cover - display must never fail closed
+            return list(snap.accounts)
 
     def __init__(self) -> None:
         super().__init__()

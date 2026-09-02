@@ -72,7 +72,9 @@ def test_settings_defaults_when_file_missing(tmp_path: Path):
     assert s.show_account_name is True
     assert s.title_pct == "both"
     assert s.refresh_interval == 60
-    assert s.auto_switch_enabled is False
+    # On by default: a status item that watches an account burn without acting
+    # is the state this tool exists to avoid.
+    assert s.auto_switch_enabled is True
 
 
 def test_settings_round_trip(tmp_path: Path):

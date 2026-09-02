@@ -102,7 +102,10 @@ class MenuBarSettings:
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
-    auto_switch_enabled: bool = False
+    # On by default: the menu bar exists to keep switching hands-off, and a
+    # status item that watches an account burn without acting is the state
+    # this tool is for avoiding.
+    auto_switch_enabled: bool = True
     row_style: str = "compact"  # one of ROW_STYLE_CHOICES
     show_resets: bool = False  # second, dimmed line with reset countdowns
 
@@ -279,6 +282,41 @@ def usage_summary(
     if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
         parts.append(f"$ {spend['pct']:.0f}%")
     return " · ".join(parts) if parts else "usage unavailable"
+
+
+def _in_switch_order(accounts: list, settings) -> list:
+    """Menu rows in the order the engine would reach for them.
+
+    Same ordering the watch view uses, from the same key the engine ranks by:
+    a menu that lists accounts in slot order tells you nothing about what
+    happens next, and one that invents its own order would contradict the
+    switch that follows it.
+
+    Never raises. This runs while building a menu, and a status item that
+    fails to draw is worse than one drawn in the wrong order.
+    """
+    try:
+        from claude_swap.autoswitch import preference_order
+        from claude_swap.settings import load_settings, parse_model_names
+
+        auto = load_settings(get_backup_root())
+        by_num = {row[0]: row for row in accounts}
+        usage = {
+            row[0]: row[4]
+            for row in accounts
+            if not row[2] and not row[6]  # not active, not disabled
+        }
+        ordered = preference_order(
+            usage,
+            models=parse_model_names(auto.model),
+            consume_first=auto.strategy == "consume-first",
+            now=time.time(),
+        )
+        active = [r for r in accounts if r[2]]
+        disabled = [r for r in accounts if r[6] and not r[2]]
+        return active + [by_num[n] for n in ordered] + disabled
+    except Exception:  # pragma: no cover - never break the menu
+        return list(accounts)
 
 
 def format_account_label(
@@ -1193,7 +1231,7 @@ def run(switcher) -> int:
                             _purge(_sub)
                 _purge(self.menu._menu)
             self.menu.clear()
-            accounts = self.snapshot["accounts"]
+            accounts = _in_switch_order(self.snapshot["accounts"], self.settings)
             aligned, header = self._aligned_titles(accounts)
             account_items = []
             if header is not None:
