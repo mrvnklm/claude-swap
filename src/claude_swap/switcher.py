@@ -5193,6 +5193,56 @@ class ClaudeAccountSwitcher:
             )
         return plans
 
+    def _publish_host_claim(self, number: str, email: str, org_uuid: str) -> None:
+        """Tell the other machine which account this one is now using.
+
+        Called from the switch chokepoint rather than from the auto-switch
+        engine, because it used to live in ``AutoSwitchEngine._perform`` and so
+        only the engine ever republished. Every `cswap switch`, every menu-bar
+        switch and every TUI switch then left the file naming an account this
+        machine had already left — measured on a live fleet at 38 hours across
+        eight switches. A claim that lies is worse than no claim.
+
+        Best-effort in every direction: an account that cannot be named
+        publishes nothing, a session count that cannot be read publishes None
+        (which peers read as "at least one"), and an unwritable file is simply
+        not written. The switch has already committed by the time this runs and
+        must never be reported as failed because of it.
+        """
+        try:
+            from claude_swap import host_claim, process_detection
+
+            busy: int | None
+            unreadable = 0
+            try:
+                sessions, unreadable = process_detection.scan_sessions()
+                busy = sum(
+                    1 for s in sessions if getattr(s, "status", None) == "busy"
+                )
+            except Exception:
+                busy, unreadable = None, 0
+            identity = self.account_identities().get(str(number), {})
+            now = time.time()
+            record = host_claim.build_claim(
+                {
+                    **identity,
+                    # org_uuid comes from the row the switch just committed;
+                    # prefer it over a re-read that could race a rename.
+                    "organizationUuid": org_uuid or identity.get("organizationUuid", ""),
+                    "email": identity.get("email") or email,
+                },
+                # The switch is what made this account active, so "since" is
+                # now. It is informational only — freshness is the reader's
+                # pulledAt stamp, never this.
+                since=now,
+                now=now,
+                busy_sessions=busy,
+                unreadable_sessions=unreadable,
+            )
+            host_claim.publish(self.backup_dir, record)
+        except Exception:
+            self._logger.debug("host claim not published", exc_info=True)
+
     def _replan_new_active(self, number: str, email: str, org_uuid: str) -> None:
         """Pull the just-activated account's poll plan to the active floor.
 
@@ -6973,11 +7023,9 @@ class ClaudeAccountSwitcher:
                     print()
                     self._print_switch_followup()
                     print()
-                self._replan_new_active(
-                    target_account,
-                    target_email,
-                    data["accounts"][target_account].get("organizationUuid", ""),
-                )
+                org = data["accounts"][target_account].get("organizationUuid", "")
+                self._replan_new_active(target_account, target_email, org)
+                self._publish_host_claim(target_account, target_email, org)
                 return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
             current_email, _ = current_identity
@@ -7239,11 +7287,9 @@ class ClaudeAccountSwitcher:
             print()
             self._print_switch_followup()
             print()
-        self._replan_new_active(
-            target_account,
-            target_email,
-            data["accounts"][target_account].get("organizationUuid", ""),
-        )
+        org = data["accounts"][target_account].get("organizationUuid", "")
+        self._replan_new_active(target_account, target_email, org)
+        self._publish_host_claim(target_account, target_email, org)
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
     def _print_switch_followup(self) -> None:

@@ -21,11 +21,24 @@ The file is meant to be readable by a peer over ssh, so it must stay boring.
 
 TIME IS THE HARD PART. Nothing in this tool keeps a monotonic or logical clock,
 so a peer's timestamp cannot be compared against the reader's own — a minute of
-NTP drift would silently change who owns what. Every claim therefore carries
-``publisherNow``, the publisher's clock at the moment it wrote, and freshness is
-judged as ``publisherNow - since`` inside one clock domain. The reader's clock
-is used for exactly one thing: how long ago it *pulled* the file, which is its
-own measurement and not the peer's.
+NTP drift would silently change who owns what. Freshness is therefore measured
+entirely inside the READER's clock domain: ``write_peer_claim`` stamps
+``pulledAt`` when the file lands here, and a claim is live while
+``now - pulledAt`` is under the TTL. Both ends of that subtraction are this
+machine's own clock, so drift cannot enter.
+
+The publisher's own timestamps ride along and are used for exactly one thing:
+``publisherNow - since`` says how long that machine had been sitting on the
+account, which breaks a tie when two peers name the same one. It is NOT a
+freshness measure, and it was one — with ``since`` assigned from the same
+``clock()`` call as ``publisherNow`` a line earlier, every published record had
+an age of ~0 and ``is_live`` was unconditionally true. A claim on the live
+fleet stood for 38 hours naming an account its machine had left. A TTL that
+cannot fire is worse than no TTL, because it reads like a safeguard.
+
+A claim with no ``pulledAt`` is not live. That is the fail-open direction: it
+re-admits the account rather than excluding it forever on a file nobody can
+date.
 
 TWO FAILURE RULES, and they point in opposite directions on purpose:
 
@@ -45,6 +58,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -90,18 +104,36 @@ class Claim:
     published_at: float  # publisher clock at write time
     busy_sessions: int | None  # None = the publisher could not tell
     unreadable_sessions: int
+    # Reader's clock when this file landed here. None for a claim that was
+    # never pulled through write_peer_claim (a hand-copied file, or one from
+    # before this field existed) — such a claim cannot be dated and is
+    # therefore not live.
+    pulled_at: float | None = None
 
     @property
-    def age_s(self) -> float:
-        """Seconds the claim had been standing when it was written.
+    def standing_s(self) -> float:
+        """Seconds this machine had been on the account when it published.
 
-        Measured inside the publisher's own clock domain — the reader's clock
-        never enters, because there is no shared time base to compare against.
+        The publisher's own clock on both sides of the subtraction. This is a
+        tie-break between two peers naming one account, NOT a freshness
+        measure — see the module docstring for what happened when it was one.
         """
         return max(0.0, self.published_at - self.since)
 
-    def is_live(self, ttl_s: float = CLAIM_TTL_S) -> bool:
-        return self.age_s < ttl_s
+    def stale_s(self, now: float) -> float | None:
+        """Seconds since this claim was pulled, or None if it cannot be dated."""
+        if self.pulled_at is None:
+            return None
+        return max(0.0, now - self.pulled_at)
+
+    def is_live(self, now: float, ttl_s: float = CLAIM_TTL_S) -> bool:
+        """Whether this claim still speaks for its machine.
+
+        ``now`` is the READER's clock, and so is ``pulled_at`` — the publisher's
+        clock is deliberately absent from this comparison.
+        """
+        stale = self.stale_s(now)
+        return stale is not None and stale < ttl_s
 
     @property
     def pressure(self) -> int:
@@ -173,6 +205,7 @@ def _parse(raw: object) -> Claim | None:
     busy = raw.get("busySessions")
     busy = int(busy) if isinstance(busy, (int, float)) else None
     unreadable = raw.get("unreadableSessions")
+    pulled = raw.get("pulledAt")
     return Claim(
         host=str(raw.get("host") or "unknown"),
         key=key,
@@ -181,6 +214,13 @@ def _parse(raw: object) -> Claim | None:
         published_at=published_at,
         busy_sessions=busy,
         unreadable_sessions=int(unreadable) if isinstance(unreadable, (int, float)) else 0,
+        # bool excluded: `True` is an int in Python and would date a claim to
+        # the epoch, i.e. permanently stale rather than undatable.
+        pulled_at=(
+            float(pulled)
+            if isinstance(pulled, (int, float)) and not isinstance(pulled, bool)
+            else None
+        ),
     )
 
 
@@ -211,9 +251,15 @@ def read_peers(backup_dir: Path) -> list[Claim]:
 
 
 def claimed_keys(
-    claims: list[Claim], *, exclude_host: str | None = None, ttl_s: float = CLAIM_TTL_S
+    claims: list[Claim],
+    *,
+    now: float,
+    exclude_host: str | None = None,
+    ttl_s: float = CLAIM_TTL_S,
 ) -> dict[str, Claim]:
     """``{identity key: claim}`` for every live peer claim.
+
+    ``now`` is the reader's clock; freshness never leaves that domain.
 
     ``exclude_host`` drops this machine's own claim, which matters when a claim
     directory has been synced rather than pulled — a machine must never exclude
@@ -223,12 +269,12 @@ def claimed_keys(
     for claim in claims:
         if exclude_host is not None and claim.host == exclude_host:
             continue
-        if not claim.is_live(ttl_s):
+        if not claim.is_live(now, ttl_s):
             continue
         # Two peers naming one account should not happen; if it does, the one
         # that has held it longest is the more established fact.
         current = out.get(claim.key)
-        if current is None or claim.age_s > current.age_s:
+        if current is None or claim.standing_s > current.standing_s:
             out[claim.key] = claim
     return out
 
@@ -245,7 +291,9 @@ def peer_pressure(claims: Mapping[str, Claim], key: str | None) -> int:
     return claim.pressure if claim is not None else 0
 
 
-def write_peer_claim(backup_dir: Path, host: str, raw_text: str) -> bool:
+def write_peer_claim(
+    backup_dir: Path, host: str, raw_text: str, *, now: float | None = None
+) -> bool:
     """Store text pulled from a peer. False when it is not a usable claim.
 
     Validated before it lands, so a truncated scp or an error message captured
@@ -257,6 +305,12 @@ def write_peer_claim(backup_dir: Path, host: str, raw_text: str) -> bool:
         return False
     if _parse(parsed) is None:
         return False
+    # Stamped here, with OUR clock, because this is the one moment a reader can
+    # honestly date: the file exists on this machine now. The publisher's own
+    # timestamps are not comparable against ours and are never used for
+    # freshness. Overwrites any pulledAt the peer sent — a publisher does not
+    # get to declare how fresh it is on our side.
+    parsed["pulledAt"] = float(now if now is not None else time.time())
     safe = "".join(c for c in host if c.isalnum() or c in "-_.") or "peer"
     target = peer_dir(backup_dir) / f"{safe}.json"
     try:

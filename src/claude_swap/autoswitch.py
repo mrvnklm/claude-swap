@@ -1216,9 +1216,19 @@ class AutoSwitchEngine:
         # Fails OPEN. `claimed` is empty when the peer is unreachable, its
         # claim is stale, or nothing has ever been pulled, so the fleet is
         # whole again rather than shrinking behind a peer that went away.
-        peer_claims = host_claim.claimed_keys(
-            host_claim.read_peers(self.switcher.backup_dir),
-            exclude_host=host_claim.host_name(),
+        # Read the files first and only then consult the clock: with no peer
+        # directory — the overwhelmingly common case, and every configuration
+        # that never pulls — this costs one failed glob and no clock read at
+        # all, so the tick's call order is unchanged for them.
+        pulled = host_claim.read_peers(self.switcher.backup_dir)
+        peer_claims = (
+            host_claim.claimed_keys(
+                pulled,
+                now=self.clock(),
+                exclude_host=host_claim.host_name(),
+            )
+            if pulled
+            else {}
         )
         identities = self.switcher.account_identities() if peer_claims else {}
         peer_held = {
@@ -2390,7 +2400,6 @@ class AutoSwitchEngine:
             # portable JSON, and every other reader of this file would have to
             # learn about it.
             state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
-            self._publish_claim(number, email, state["lastSwitchAt"])
             state["leftHeadroom"], recovery = left
             state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
             # A `consume-first` phase-2 refetch can write the SAME (None,
@@ -2501,39 +2510,6 @@ class AutoSwitchEngine:
         if earliest is None:
             return None
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
-
-    def _publish_claim(self, number: str, email: str, since: float) -> None:
-        """Tell the other machine which account this one is now using.
-
-        Written from inside `_perform`'s state-lock block, so a claim can never
-        describe a switch that did not happen — and a dry run returns from
-        `_perform` before that block, so no guard is needed here for it (one
-        was written, and deleting it left the suite green, which is what dead
-        code looks like). Best-effort in every direction:
-        an account that cannot be named publishes nothing, a session count that
-        cannot be read publishes None (which peers read as "at least one"), and
-        an unwritable file is simply not written. Publishing is a courtesy to
-        the peer and must never take down the switch that prompted it.
-        """
-        try:
-            identity = self.switcher.account_identities().get(str(number), {})
-            busy: int | None
-            unreadable = 0
-            try:
-                sessions, unreadable = process_detection.scan_sessions()
-                busy = sum(1 for s in sessions if getattr(s, "status", None) == "busy")
-            except Exception:
-                busy, unreadable = None, 0
-            record = host_claim.build_claim(
-                {**identity, "email": identity.get("email") or email},
-                since=since,
-                now=self.clock(),
-                busy_sessions=busy,
-                unreadable_sessions=unreadable,
-            )
-            host_claim.publish(self.switcher.backup_dir, record)
-        except Exception:  # pragma: no cover - never break a completed switch
-            _logger.debug("host claim not published", exc_info=True)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)

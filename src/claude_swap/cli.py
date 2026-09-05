@@ -1169,6 +1169,24 @@ def _warn_if_marks_are_inert(switcher) -> None:
         )
 
 
+# What to run on the far side. A non-interactive ssh does NOT source a login
+# profile, so the PATH it gets is the bare system one — measured on this fleet:
+# /opt/homebrew/bin, /usr/bin, /bin, /usr/sbin, /sbin and nothing else. `uv tool
+# install` and `pipx` both put cswap in ~/.local/bin, so the plain command exits
+# 127 with "command not found", which reads like a broken install rather than a
+# PATH problem. A login shell ($SHELL -lc) was tried first and did NOT fix it
+# here, so the PATH is set explicitly.
+_PEER_SHOW_CMD = 'PATH="$HOME/.local/bin:$PATH" cswap peers show'
+
+
+def _since_pull(claim, now: float) -> str:
+    """How long ago this claim was pulled, in the tool's usual shape."""
+    from claude_swap.tui.data import format_duration
+
+    stale = claim.stale_s(now)
+    return "just now" if stale is None else f"pulled {format_duration(stale)} ago"
+
+
 def _peers_command(argv: list[str]) -> None:
     """Handle ``cswap peers [show|pull HOST...]``.
 
@@ -1235,7 +1253,7 @@ stops being counted, and every account becomes a candidate again.
             for host in args.hosts:
                 try:
                     done = subprocess.run(
-                        ["ssh", host, "cswap peers show"],
+                        ["ssh", host, _PEER_SHOW_CMD],
                         capture_output=True, text=True, timeout=20,
                     )
                 except (OSError, subprocess.SubprocessError) as e:
@@ -1244,7 +1262,13 @@ stops being counted, and every account becomes a candidate again.
                     continue
                 if done.returncode != 0:
                     detail = (done.stderr or done.stdout or "").strip().splitlines()
-                    error(f"{host}: {detail[-1] if detail else 'ssh failed'}")
+                    last = detail[-1] if detail else "ssh failed"
+                    error(f"{host}: {last}")
+                    if done.returncode == 127:
+                        print(dimmed(
+                            "  cswap was not found on that machine's PATH. "
+                            "Install it there, or link it into ~/.local/bin."
+                        ))
                     failures += 1
                     continue
                 if host_claim.write_peer_claim(backup_dir, host, done.stdout):
@@ -1256,15 +1280,26 @@ stops being counted, and every account becomes a candidate again.
                 sys.exit(1)
             return
 
+        now = time.time()
+        me = host_claim.host_name()
         claims = host_claim.read_peers(backup_dir)
-        live = host_claim.claimed_keys(claims, exclude_host=host_claim.host_name())
+        live = host_claim.claimed_keys(claims, now=now, exclude_host=me)
         if args.json:
             print(json.dumps({
                 "schemaVersion": host_claim.SCHEMA_VERSION,
                 "peers": [
                     {
                         "host": c.host, "identityKey": c.key, "email": c.email,
-                        "ageSeconds": round(c.age_s, 1), "live": c.is_live(),
+                        # How long ago WE pulled it (null: never dated, so not
+                        # live) and how long that machine had been on the
+                        # account when it published. Two different questions;
+                        # conflating them is what made the TTL unfireable.
+                        "pulledSecondsAgo": (
+                            None if c.stale_s(now) is None
+                            else round(c.stale_s(now), 1)
+                        ),
+                        "standingSeconds": round(c.standing_s, 1),
+                        "live": c.is_live(now),
                         "busySessions": c.busy_sessions,
                     }
                     for c in claims
@@ -1276,11 +1311,18 @@ stops being counted, and every account becomes a candidate again.
             print(dimmed("  fetch one with: cswap peers pull <host>"))
             return
         print(bolded("Peer claims:"))
-        by_key = {c.key: c for c in live.values()}
+        excluded = set(live)
         for c in sorted(claims, key=lambda c: c.host):
-            held = "held" if c.key in by_key else muted("stale — not excluded")
             org = c.key.rsplit(":", 1)[-1][:8]
-            print(f"  {c.host}: {c.email or '?'} · org {org} — {held}")
+            if c.host == me:
+                note = muted("this machine — never excluded")
+            elif c.key in excluded:
+                note = f"held ({_since_pull(c, now)})"
+            elif c.stale_s(now) is None:
+                note = muted("undated — not excluded")
+            else:
+                note = muted(f"stale {_since_pull(c, now)} — not excluded")
+            print(f"  {c.host}: {c.email or '?'} · org {org} — {note}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

@@ -7145,15 +7145,31 @@ class TestPeerClaims:
         _add_org_to_live_config(h, "org-1")
         return h
 
-    def _claim(self, h: EngineHarness, number: str, *, host="studio", age=60.0) -> None:
+    def _claim(
+        self, h: EngineHarness, number: str, *, host="studio", pulled_ago=60.0
+    ) -> None:
+        """Land a peer claim the way a real pull would.
+
+        The record itself is built by build_claim from a real identity, and
+        the pull is stamped on the HARNESS clock — the same one the engine
+        reads. An earlier version hand-built `since` and `publisherNow` to
+        simulate age, which is how a TTL that could never fire stayed green:
+        the engine assigns both from one clock() call, so no record it emits
+        has any age at all.
+        """
         key = identity_key(h.switcher.account_identities()[number])
         assert key is not None
         now = h.clock.now
-        host_claim.write_peer_claim(h.switcher.backup_dir, host, json.dumps({
-            "schemaVersion": 1, "host": host, "identityKey": key,
-            "email": "x@y.z", "since": now - age, "publisherNow": now,
-            "busySessions": 2, "unreadableSessions": 0,
-        }))
+        host_claim.write_peer_claim(
+            h.switcher.backup_dir,
+            host,
+            json.dumps({
+                "schemaVersion": 1, "host": host, "identityKey": key,
+                "email": "x@y.z", "since": now, "publisherNow": now,
+                "busySessions": 2, "unreadableSessions": 0,
+            }),
+            now=now - pulled_ago,
+        )
 
     # Active is over threshold, so the tick must move; #2 has the most headroom.
     OVER = {
@@ -7173,11 +7189,26 @@ class TestPeerClaims:
         assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
         assert h.active_number() == 3, "the engine took an account the peer holds"
 
-    def test_a_stale_claim_fails_open(self, temp_home):
+    def test_a_claim_pulled_too_long_ago_fails_open(self, temp_home):
         # Targeting fails OPEN: a peer that went quiet must not keep an account
         # excluded forever, or this machine parks on a shrinking pool.
         h = self._harness(temp_home)
-        self._claim(h, "2", age=host_claim.CLAIM_TTL_S + 1)
+        self._claim(h, "2", pulled_ago=host_claim.CLAIM_TTL_S + 1)
+        assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_an_undated_claim_fails_open(self, temp_home):
+        """A file dropped into peer_claims/ by hand, or written by a version
+        before pulledAt existed. It cannot be aged, so it must not exclude."""
+        h = self._harness(temp_home)
+        key = identity_key(h.switcher.account_identities()["2"])
+        target = host_claim.peer_dir(h.switcher.backup_dir) / "studio.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({
+            "schemaVersion": 1, "host": "studio", "identityKey": key,
+            "email": "x@y.z", "since": h.clock.now, "publisherNow": h.clock.now,
+            "busySessions": 2, "unreadableSessions": 0,
+        }))
         assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
@@ -7188,6 +7219,21 @@ class TestPeerClaims:
         self._claim(h, "2", host=host_claim.host_name())
         assert h.tick_with_usage(self.OVER) is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    def test_a_manual_switch_republishes_the_claim(self, temp_home):
+        """The publisher used to live in AutoSwitchEngine._perform, so only an
+        AUTO switch republished. Every `cswap switch`, menu-bar switch and TUI
+        switch then left the file naming an account the machine had left —
+        measured on a live fleet at 38 hours across eight switches."""
+        h = self._harness(temp_home)
+        h.switcher.switch_to("3")
+
+        record = json.loads(
+            host_claim.claim_path(h.switcher.backup_dir).read_text(encoding="utf-8")
+        )
+        assert record["identityKey"] == identity_key(
+            h.switcher.account_identities()["3"]
+        )
 
     def test_a_switch_publishes_a_claim_naming_the_new_account(self, temp_home):
         h = self._harness(temp_home)

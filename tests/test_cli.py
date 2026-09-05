@@ -1963,3 +1963,90 @@ class TestCancelDoesNotBreakExistingFlags:
                 cli.main()
         assert "ambiguous" not in capsys.readouterr().err
 
+
+
+class TestPeersPull:
+    """`cswap peers pull` had no tests and could not work on any real fleet:
+    a non-interactive ssh does not source a login profile, so the plain
+    `cswap` it ran exited 127 in both directions."""
+
+    UUID = "6a64d5cc-9af1-4bca-aaa4-7409aad57394"
+    ORG = "af232ed4-8c8a-4a46-b942-f5ff6528c80c"
+
+    def _claim_json(self, now: float = 1_800_000_000.0) -> str:
+        from claude_swap import host_claim
+
+        return json.dumps(host_claim.build_claim(
+            {"uuid": self.UUID, "organizationUuid": self.ORG, "email": "a@b.c"},
+            since=now, now=now, busy_sessions=1, host="studio",
+        ))
+
+    def _run(self, argv, completed):
+        with patch("subprocess.run", return_value=completed) as run, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "peers", *argv]):
+            try:
+                cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code or 0
+        return code, run
+
+    def test_the_remote_command_does_not_rely_on_the_peers_login_path(
+        self, temp_home, capsys
+    ):
+        """Measured on this fleet: a non-interactive ssh gets /opt/homebrew/bin,
+        /usr/bin, /bin, /usr/sbin, /sbin — and uv and pipx both install into
+        ~/.local/bin, which is not among them."""
+        done = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=self._claim_json(), stderr=""
+        )
+        code, run = self._run(["pull", "studio"], done)
+
+        assert code == 0
+        remote = run.call_args[0][0][-1]
+        assert "$HOME/.local/bin" in remote
+        assert remote.endswith("cswap peers show")
+
+    def test_a_pulled_claim_lands_and_is_dated(self, temp_home):
+        from claude_swap import host_claim
+
+        done = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=self._claim_json(), stderr=""
+        )
+        self._run(["pull", "studio"], done)
+
+        switcher = ClaudeAccountSwitcher()
+        pulled = host_claim.read_peers(switcher.backup_dir)
+        assert len(pulled) == 1
+        # Dated on arrival, or it can never expire.
+        assert pulled[0].pulled_at is not None
+
+    def test_a_command_not_found_says_what_is_actually_wrong(
+        self, temp_home, capsys
+    ):
+        """127 with the last stderr line reads as a broken install. It is a
+        PATH problem, and the operator has to be told which."""
+        done = subprocess.CompletedProcess(
+            args=[], returncode=127, stdout="",
+            stderr="zsh:1: command not found: cswap",
+        )
+        code, _ = self._run(["pull", "studio"], done)
+
+        assert code == 1
+        out = capsys.readouterr().out
+        assert "PATH" in out
+
+    def test_garbage_from_the_far_side_is_not_stored_as_a_claim(
+        self, temp_home
+    ):
+        from claude_swap import host_claim
+
+        done = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="No claim published yet", stderr=""
+        )
+        code, _ = self._run(["pull", "studio"], done)
+
+        assert code == 1
+        switcher = ClaudeAccountSwitcher()
+        assert host_claim.read_peers(switcher.backup_dir) == []
