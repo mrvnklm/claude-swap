@@ -1065,6 +1065,11 @@ def run(switcher) -> int:
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
+            # Set only by the Quit menu item. Anything else that reaches
+            # applicationWillTerminate_ (SIGINT, a Cocoa-side terminate) is an
+            # unwanted teardown, and _exit_status turns it into a failure code
+            # so launchd's KeepAlive can bring the service back.
+            self._quit_intent = False
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -1562,7 +1567,8 @@ def run(switcher) -> int:
             self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
-            self._stop_engine()
+            self._quit_intent = True  # before quit_application: before_quit
+            self._stop_engine()       # fires from inside it, on this thread
             rumps.quit_application()
 
         def on_toggle_name(self, _sender):
@@ -1625,5 +1631,39 @@ def run(switcher) -> int:
                 self.rebuild_menu()
             return cb
 
-    MenuBarApp().run()
+    app = MenuBarApp()
+
+    # A menu-bar app that is killed (SIGINT, or a Cocoa-side terminate) runs
+    # rumps' Mach interrupt handler, which calls NSApp().terminate_() — the very
+    # same path the Quit button takes. The process then exits 0 and looks to
+    # launchd exactly like a user who chose to quit, so `KeepAlive
+    # {SuccessfulExit: false}` correctly declines to restart it. Measured
+    # against rumps 0.4.0: SIGINT without this hook exits 0, with it exits 70.
+    #
+    # rumps.events.EventEmitter.emit swallows Exception, so raising here would
+    # be discarded — os._exit is load-bearing, not a shortcut. It also skips the
+    # atexit/flush machinery, which is why the log write comes first.
+    #
+    # Known gap: rumps' AppHelper has a second teardown that calls sys.exit(0)
+    # directly and unwinds without terminate_, so before_quit never fires. That
+    # path still exits 0. This narrows the failure, it does not close it.
+    def _exit_status():
+        if getattr(app, "_quit_intent", False):
+            return  # the user chose Quit; a clean exit is the truth
+        switcher._logger.warning(
+            "menu bar terminated without a Quit; exiting non-zero so the "
+            "service manager restarts it"
+        )
+        for handler in list(switcher._logger.handlers):
+            try:
+                handler.flush()
+            except Exception:
+                pass
+        os._exit(70)  # EX_SOFTWARE
+
+    emitter = getattr(getattr(rumps, "events", None), "before_quit", None)
+    if emitter is not None:  # older rumps releases have no event emitters
+        emitter.register(_exit_status)
+
+    app.run()
     return 0

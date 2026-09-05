@@ -1120,3 +1120,62 @@ def test_a_crash_is_logged_at_warning_not_debug(tmp_path, monkeypatch, caplog):
 
     assert any("crashed" in r.message for r in caplog.records)
 
+
+# --- exit status on an unwanted teardown ---------------------------------------
+
+def _registered_before_quit_hook(tmp_path, monkeypatch):
+    """Build the app and hand back the before_quit callback ``run()`` installed."""
+    hooks = []
+    monkeypatch.setattr(
+        _rumps.events.before_quit, "register", lambda fn: hooks.append(fn) or fn
+    )
+    app = _build_app(tmp_path, monkeypatch)
+    assert len(hooks) == 1, "run() must install exactly one before_quit hook"
+    return app, hooks[0]
+
+
+@needs_rumps
+def test_a_teardown_without_a_quit_exits_non_zero(tmp_path, monkeypatch):
+    """The 36-hour outage in one assertion: rumps routes SIGINT through the very
+    same terminate_ the Quit button uses, so the process exited 0 and launchd's
+    ``KeepAlive {SuccessfulExit: false}`` correctly declined to restart it."""
+    app, hook = _registered_before_quit_hook(tmp_path, monkeypatch)
+    codes = []
+    monkeypatch.setattr(menubar.os, "_exit", lambda code: codes.append(code))
+
+    assert app._quit_intent is False  # nobody chose Quit
+    hook()
+
+    assert codes == [70]
+
+
+@needs_rumps
+def test_the_quit_menu_item_still_exits_zero(tmp_path, monkeypatch):
+    """The guard must not turn a deliberate Quit into a restart loop."""
+    app, hook = _registered_before_quit_hook(tmp_path, monkeypatch)
+    codes = []
+    monkeypatch.setattr(menubar.os, "_exit", lambda code: codes.append(code))
+    monkeypatch.setattr(_rumps, "quit_application", lambda *a, **kw: None)
+
+    app.on_quit(None)
+    hook()
+
+    assert app._quit_intent is True
+    assert codes == [], "a user who chose Quit must get a clean exit"
+
+
+@needs_rumps
+def test_the_intent_flag_is_set_before_quit_application_is_called(
+    tmp_path, monkeypatch
+):
+    """before_quit fires from inside quit_application on this same thread, so a
+    flag set afterwards would always be read as False."""
+    app, hook = _registered_before_quit_hook(tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        _rumps, "quit_application", lambda *a, **kw: seen.append(app._quit_intent)
+    )
+
+    app.on_quit(None)
+
+    assert seen == [True]
