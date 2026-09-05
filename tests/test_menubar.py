@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
 import plistlib
 import sys
 from pathlib import Path
@@ -998,3 +999,124 @@ class TestTitleWithoutIcon:
         path = tmp_path / "menubar_settings.json"
         menubar.MenuBarSettings(show_icon=False).save(path)
         assert menubar.MenuBarSettings.load(path).show_icon is False
+
+
+# --- the MenuBarApp class itself ------------------------------------------------
+# Nothing below reaches AppKit through a running event loop: rumps builds its
+# NSMenuItems lazily and App.run() is the only call that starts one, so patching
+# that one method lets the real class be constructed and driven headlessly. Three
+# defects have shipped inside this class (a lost account_items init, a NameError
+# swallowed by its own handler, an engine reference kept after a crash) precisely
+# because it had no harness at all.
+
+try:
+    import rumps as _rumps
+except ImportError:  # pragma: no cover - exercised only where rumps is absent
+    _rumps = None
+
+needs_rumps = pytest.mark.skipif(_rumps is None, reason="rumps not installed")
+
+
+class _StubSwitcher:
+    def __init__(self, tmp_path):
+        self.backup_dir = tmp_path
+        self._logger = logging.getLogger("claude-swap-test")
+
+    def _get_claude_config_path(self):
+        return self.backup_dir / "claude.json"
+
+    def _get_current_account(self):
+        return None
+
+
+def _build_app(tmp_path, monkeypatch, *, autoswitch=False):
+    """Construct the real MenuBarApp without entering the event loop."""
+    captured = {}
+
+    def _fake_run(self, *a, **kw):
+        captured["app"] = self
+
+    monkeypatch.setattr(_rumps.App, "run", _fake_run)
+    monkeypatch.setattr(menubar, "ensure_notification_identity", lambda *a, **kw: None)
+    # The engine is what these tests drive by hand; never let one start for real.
+    monkeypatch.setattr(
+        menubar, "_in_switch_order", lambda accounts, settings: list(accounts)
+    )
+    (tmp_path / "menubar_settings.json").write_text(
+        json.dumps({"auto_switch_enabled": autoswitch})
+    )
+    assert menubar.run(_StubSwitcher(tmp_path)) == 0
+    return captured["app"]
+
+
+@needs_rumps
+def test_a_crashed_engine_is_released_so_it_can_be_restarted(tmp_path, monkeypatch):
+    """The shipped bug: run_loop raised, self._engine stayed set, and
+    _start_engine's ``is not None`` guard then refused every restart for the
+    life of the process while the menu still showed auto-switch as on."""
+    app = _build_app(tmp_path, monkeypatch)
+
+    class _Boom:
+        def run_loop(self):
+            raise RuntimeError("engine died")
+
+        def stop(self):
+            pass
+
+    engine = _Boom()
+    app._engine = engine
+    app._run_engine(engine)  # runs on the engine thread in production
+
+    assert app._engine is None, "a crashed engine must not block its own restart"
+    assert app._dirty is True
+
+
+@needs_rumps
+def test_a_crashed_engine_does_not_clear_its_successor(tmp_path, monkeypatch):
+    """_run_engine runs on a thread that may finish AFTER a restart installed a
+    new engine. Clearing unconditionally would kill the healthy one."""
+    app = _build_app(tmp_path, monkeypatch)
+
+    class _Boom:
+        def run_loop(self):
+            raise RuntimeError("engine died")
+
+    dead, successor = _Boom(), object()
+    app._engine = successor
+    app._run_engine(dead)
+
+    assert app._engine is successor
+
+
+@needs_rumps
+def test_a_clean_engine_exit_also_releases_the_reference(tmp_path, monkeypatch):
+    """run_loop returning normally (stop() was called) must leave the same
+    state as a crash — the finally, not the except, is what does the work."""
+    app = _build_app(tmp_path, monkeypatch)
+
+    class _Quiet:
+        def run_loop(self):
+            return None
+
+    engine = _Quiet()
+    app._engine = engine
+    app._run_engine(engine)
+
+    assert app._engine is None
+
+
+@needs_rumps
+def test_a_crash_is_logged_at_warning_not_debug(tmp_path, monkeypatch, caplog):
+    """It was ``debug``, so the crash left no trace at the default level —
+    both service log files were empty across a 36-hour outage."""
+    app = _build_app(tmp_path, monkeypatch)
+
+    class _Boom:
+        def run_loop(self):
+            raise RuntimeError("engine died")
+
+    with caplog.at_level(logging.WARNING, logger="claude-swap-test"):
+        app._run_engine(_Boom())
+
+    assert any("crashed" in r.message for r in caplog.records)
+

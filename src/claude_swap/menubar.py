@@ -1176,7 +1176,17 @@ def run(switcher) -> int:
             try:
                 engine.run_loop()
             except Exception:
-                self.switcher._logger.debug("auto-switch engine crashed", exc_info=True)
+                # Was ``debug`` and left ``self._engine`` set: _start_engine's
+                # guard then refused every restart while the menu still showed
+                # auto-switch as on. A crash has to be both audible and
+                # recoverable.
+                self.switcher._logger.warning("auto-switch engine crashed", exc_info=True)
+            finally:
+                # Identity compare: a restart may already have installed a new
+                # engine, and this thread must not clear its successor.
+                if self._engine is engine:
+                    self._engine = None
+                    self._dirty = True
 
         def _stop_engine(self):
             if self._engine is not None:
