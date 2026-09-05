@@ -80,7 +80,27 @@ class TestLoadSettings:
         }))
         loaded = load_settings(tmp_path)
         assert loaded.threshold == AutoSwitchSettings().threshold
-        assert loaded.include_api_key_accounts is True
+        # A truthy non-bool is a bad type like any other, so it takes the same
+        # route the name of this test promises. It used to load as True.
+        assert loaded.include_api_key_accounts is False
+
+    @pytest.mark.parametrize("written", ["false", "0", "no", "off"])
+    def test_a_stringly_typed_false_does_not_load_as_true(
+        self, tmp_path: Path, written: str
+    ):
+        """The dangerous direction: a hand-edited "false" is a non-empty string,
+        so ``bool(value)`` turned every one of these ON."""
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"includeApiKeyAccounts": written}})
+        )
+        assert load_settings(tmp_path).include_api_key_accounts is False
+
+    def test_a_real_bool_is_kept(self, tmp_path: Path):
+        """The fallback must not swallow the value it exists to protect."""
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"includeApiKeyAccounts": True}})
+        )
+        assert load_settings(tmp_path).include_api_key_accounts is True
 
     def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
         settings_path(tmp_path).write_text(

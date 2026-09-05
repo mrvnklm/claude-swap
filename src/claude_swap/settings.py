@@ -200,7 +200,18 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             clamped = num(value, spec.default, spec.lo, spec.hi)
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
-            kwargs[spec.field] = bool(value)
+            # NOT bool(value): a hand-edited "false" (or "0") is a non-empty
+            # string and would load as True — a garbage value turning a switch
+            # ON. Anything that is not a real bool reverts to the default, so
+            # the failure direction is the safe one.
+            if not isinstance(value, bool):
+                if value is not None:
+                    _logger.warning(
+                        "settings.json: %s expects true or false, got %r; using %r",
+                        spec.dotted, value, spec.default,
+                    )
+                value = spec.default
+            kwargs[spec.field] = value
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
