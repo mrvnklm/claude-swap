@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import os
 import plistlib
 import sys
 from pathlib import Path
@@ -73,9 +74,9 @@ def test_settings_defaults_when_file_missing(tmp_path: Path):
     assert s.show_account_name is True
     assert s.title_pct == "both"
     assert s.refresh_interval == 60
-    # On by default: a status item that watches an account burn without acting
-    # is the state this tool exists to avoid.
-    assert s.auto_switch_enabled is True
+    # Whether an engine runs is not a display preference; it lives in
+    # settings.json as autoswitch.background.
+    assert not hasattr(s, "auto_switch_enabled")
 
 
 def test_settings_round_trip(tmp_path: Path):
@@ -84,7 +85,6 @@ def test_settings_round_trip(tmp_path: Path):
         show_account_name=False,
         title_pct="5h",
         refresh_interval=300,
-        auto_switch_enabled=True,
     )
     original.save(path)
     loaded = menubar.MenuBarSettings.load(path)
@@ -1009,12 +1009,21 @@ class TestTitleWithoutIcon:
 # swallowed by its own handler, an engine reference kept after a crash) precisely
 # because it had no harness at all.
 
+from claude_swap import autoswitch
+from claude_swap.settings import load_settings, set_setting
+
 try:
     import rumps as _rumps
 except ImportError:  # pragma: no cover - exercised only where rumps is absent
     _rumps = None
 
 needs_rumps = pytest.mark.skipif(_rumps is None, reason="rumps not installed")
+
+
+class _NoopEngine:
+    def __init__(self): self.stopped = False
+    def run_loop(self): pass
+    def stop(self): self.stopped = True
 
 
 class _StubSwitcher:
@@ -1029,7 +1038,18 @@ class _StubSwitcher:
         return None
 
 
-def _build_app(tmp_path, monkeypatch, *, autoswitch=False):
+def _bump_mtime(path: Path):
+    """Make a just-written file look changed.
+
+    set_setting can land inside the same filesystem timestamp tick as the read
+    the app cached, which would make an mtime gate skip a real change — and a
+    test that passes only because the clock was slow proves nothing.
+    """
+    st = path.stat()
+    os.utime(path, (st.st_atime, st.st_mtime + 10))
+
+
+def _build_app(tmp_path, monkeypatch, *, background=False):
     """Construct the real MenuBarApp without entering the event loop."""
     captured = {}
 
@@ -1038,13 +1058,15 @@ def _build_app(tmp_path, monkeypatch, *, autoswitch=False):
 
     monkeypatch.setattr(_rumps.App, "run", _fake_run)
     monkeypatch.setattr(menubar, "ensure_notification_identity", lambda *a, **kw: None)
-    # The engine is what these tests drive by hand; never let one start for real.
     monkeypatch.setattr(
         menubar, "_in_switch_order", lambda accounts, settings: list(accounts)
     )
-    (tmp_path / "menubar_settings.json").write_text(
-        json.dumps({"auto_switch_enabled": autoswitch})
-    )
+    if background:
+        set_setting(tmp_path, "autoswitch.background", "true")
+    # The engine is what these tests drive by hand. run() imports the class
+    # lazily from claude_swap.autoswitch, so that is where the stub belongs;
+    # otherwise construction starts a real thread against a stub switcher.
+    monkeypatch.setattr(autoswitch, "AutoSwitchEngine", lambda *a, **kw: _NoopEngine())
     assert menubar.run(_StubSwitcher(tmp_path)) == 0
     return captured["app"]
 
@@ -1179,3 +1201,115 @@ def test_the_intent_flag_is_set_before_quit_application_is_called(
     app.on_quit(None)
 
     assert seen == [True]
+
+
+# --- the engine supervisor ------------------------------------------------------
+
+@needs_rumps
+def test_a_dead_engine_is_restarted_even_when_no_setting_changed(
+    tmp_path, monkeypatch
+):
+    """The whole point of a supervisor over an mtime edge-trigger: an engine
+    thread that dies writes no settings file, so a reconcile that returns early
+    on an unchanged mtime would leave it dead forever."""
+    app = _build_app(tmp_path, monkeypatch, background=True)
+    started = []
+    monkeypatch.setattr(
+        type(app), "_start_engine", lambda self: started.append(1)
+    )
+    app._engine = None  # the thread crashed and released it
+
+    app._reconcile_engine()  # settings.json untouched since construction
+
+    assert started == [1]
+
+
+@needs_rumps
+def test_a_healthy_engine_is_left_alone(tmp_path, monkeypatch):
+    app = _build_app(tmp_path, monkeypatch, background=True)
+    started = []
+    monkeypatch.setattr(type(app), "_start_engine", lambda self: started.append(1))
+    app._engine = _NoopEngine()
+
+    app._reconcile_engine()
+
+    assert started == []
+
+
+@needs_rumps
+def test_disabling_the_setting_stops_a_running_engine(tmp_path, monkeypatch):
+    """`cswap config set autoswitch.background false` from another process must
+    reach the running menu bar; otherwise the CLI and the menu both say off
+    while accounts keep moving."""
+    app = _build_app(tmp_path, monkeypatch, background=True)
+    engine = _NoopEngine()
+    app._engine = engine
+
+    set_setting(tmp_path, "autoswitch.background", "false")
+    _bump_mtime(tmp_path / "settings.json")
+    app._reconcile_engine()
+
+    assert app._auto_on is False
+    assert engine.stopped is True
+    assert app._engine is None
+
+
+@needs_rumps
+def test_enabling_the_setting_starts_an_engine(tmp_path, monkeypatch):
+    app = _build_app(tmp_path, monkeypatch, background=False)
+    started = []
+    monkeypatch.setattr(type(app), "_start_engine", lambda self: started.append(1))
+    assert app._auto_on is False
+
+    set_setting(tmp_path, "autoswitch.background", "true")
+    _bump_mtime(tmp_path / "settings.json")
+    app._reconcile_engine()
+
+    assert app._auto_on is True
+    assert started == [1]
+
+
+@needs_rumps
+def test_an_unrelated_settings_change_does_not_redraw_the_menu(
+    tmp_path, monkeypatch
+):
+    """settings.json holds every key, so it changes for reasons that have
+    nothing to do with this switch. Without the equality guard each of those
+    marks the menu dirty, and a rebuild is the expensive operation here — it
+    tears down and re-registers every callback (see the purge in rebuild_menu).
+    The engine itself survives either way, so that is not what to assert."""
+    app = _build_app(tmp_path, monkeypatch, background=True)
+    engine = _NoopEngine()
+    app._engine = engine
+    app._dirty = False
+
+    set_setting(tmp_path, "autoswitch.threshold", "77")
+    _bump_mtime(tmp_path / "settings.json")
+    app._reconcile_engine()
+
+    assert app._dirty is False
+    assert app._engine is engine
+    assert engine.stopped is False
+
+
+@needs_rumps
+def test_the_menu_checkmark_follows_intent_not_liveness(tmp_path, monkeypatch):
+    """Tying the checkmark to a live engine takes two clicks to recover: the
+    first reads the (still true) intent and writes false."""
+    app = _build_app(tmp_path, monkeypatch, background=True)
+    app._engine = None  # crashed
+
+    assert app._auto_on is True  # what the checkmark is drawn from
+
+
+@needs_rumps
+def test_the_toggle_writes_the_shared_setting(tmp_path, monkeypatch):
+    """It used to write menubar_settings.json, where no other surface looked."""
+    app = _build_app(tmp_path, monkeypatch, background=False)
+    monkeypatch.setattr(type(app), "_start_engine", lambda self: None)
+    monkeypatch.setattr(type(app), "rebuild_menu", lambda self: None)
+
+    app.on_toggle_autoswitch(None)
+
+    assert load_settings(tmp_path).background is True
+    assert app._auto_on is True

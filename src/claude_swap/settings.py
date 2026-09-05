@@ -43,6 +43,12 @@ class AutoSwitchSettings:
     ping-pong while a strictly better account is always taken.
     """
 
+    # NOT read by the engine: it says whether a host that would otherwise start
+    # one unattended should do so. Today that is the menu bar alone — `cswap
+    # auto` runs because you typed it, and the TUI's auto screen starts dry and
+    # goes live only through an explicit confirmation. Off by default: a fresh
+    # install must not begin moving accounts on its own.
+    background: bool = False
     threshold: float = 90.0
     # Per-window overrides. The 5h and 7d windows want opposite values and a
     # single scalar compared against max(pct) cannot express that: quota not
@@ -110,6 +116,10 @@ class SettingSpec:
 SETTING_SPECS: dict[str, SettingSpec] = {
     spec.dotted: spec
     for spec in (
+        SettingSpec(
+            "autoswitch", "background", "background", "bool",
+            help="Let a long-running host (the menu bar) run the auto-switch engine",
+        ),
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
             help="Switch when the binding window reaches this pct (per-window overrides below)",

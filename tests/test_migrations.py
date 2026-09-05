@@ -21,6 +21,7 @@ from claude_swap.exceptions import MigrationIncomplete
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.migrations import run_migrations
 from claude_swap.models import Platform
+from claude_swap.settings import load_settings, set_setting
 from claude_swap.switcher import KEYRING_SERVICE, ClaudeAccountSwitcher
 
 
@@ -83,6 +84,19 @@ def _seed_sequence(switcher: ClaudeAccountSwitcher, accounts: dict) -> None:
         "accounts": accounts,
     }
     switcher._write_json(switcher.sequence_file, data)
+
+
+def _applied(switcher: ClaudeAccountSwitcher) -> set:
+    """Migration ids recorded as done.
+
+    Not the same question as "does .migrations.json exist": the registry holds
+    several migrations, and one of them completing writes the file whatever the
+    one under test did.
+    """
+    state_file = switcher.backup_dir / ".migrations.json"
+    if not state_file.exists():
+        return set()
+    return set(json.loads(state_file.read_text()).get("applied", []))
 
 
 def _patch_keyring(fake: FakeKeyring):
@@ -211,7 +225,7 @@ class TestSkips:
         with _patch_keyring(fake):
             run_migrations(switcher)
         # Unparseable sequence → never marked, so a later repair can migrate.
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in _applied(switcher)
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +309,7 @@ class TestFailures:
         # Source entry preserved, migration not recorded → retried next run.
         assert (KEYRING_SERVICE, "account-1-a@example.com") in fake.store
         assert fake.deleted == []
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in _applied(switcher)
         # The bad/partial file must not shadow the intact keyring entry.
         assert not (
             switcher.credentials_dir / ".creds-1-a@example.com.enc"
@@ -324,7 +338,7 @@ class TestFailures:
         # The healthy account migrated; the failed one is untouched + unmarked.
         assert switcher._read_account_credentials("1", "ok@example.com") == "good"
         assert (KEYRING_SERVICE, "account-2-bad@example.com") in fake.store
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in _applied(switcher)
 
     def test_partial_failure_raises_from_migration_fn(self, temp_home):
         switcher = _make_windows_switcher(temp_home)
@@ -345,7 +359,7 @@ class TestFailures:
         # Runner swallows it and leaves it unmarked.
         with patch.dict(sys.modules, {"keyring": None}):
             run_migrations(switcher)
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in _applied(switcher)
 
 
 # ---------------------------------------------------------------------------
@@ -594,3 +608,85 @@ class TestMacosKeyringToSecurity:
             run_migrations(switcher)
         state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
         assert "macos_keyring_to_security" in state["applied"]
+
+
+# ---------------------------------------------------------------------------
+# menubar_settings.json -> settings.json
+# ---------------------------------------------------------------------------
+
+
+class TestMenubarAutoswitchToSettings:
+    """The toggle used to live in the menu bar's own display-preferences file,
+    where no other surface could read or write it. It is now
+    ``autoswitch.background`` in settings.json, and the legacy key must not
+    survive as a second writable source."""
+
+    @staticmethod
+    def _switcher(temp_home: Path) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        return switcher
+
+    @staticmethod
+    def _menubar_file(switcher) -> Path:
+        return switcher.backup_dir / "menubar_settings.json"
+
+    def test_an_explicit_true_is_carried_over(self, temp_home):
+        switcher = self._switcher(temp_home)
+        self._menubar_file(switcher).write_text(
+            json.dumps({"auto_switch_enabled": True, "show_resets": True})
+        )
+
+        assert migrations.migrate_menubar_autoswitch_to_settings(switcher) is True
+
+        assert load_settings(switcher.backup_dir).background is True
+        remaining = json.loads(self._menubar_file(switcher).read_text())
+        assert "auto_switch_enabled" not in remaining
+        assert remaining["show_resets"] is True, "display preferences survive"
+
+    def test_an_explicit_false_is_not_carried_over(self, temp_home):
+        """Nothing to raise: the registered default is already off, and writing
+        it would pin the file to today's default."""
+        switcher = self._switcher(temp_home)
+        self._menubar_file(switcher).write_text(
+            json.dumps({"auto_switch_enabled": False})
+        )
+
+        migrations.migrate_menubar_autoswitch_to_settings(switcher)
+
+        assert load_settings(switcher.backup_dir).background is False
+        assert not (switcher.backup_dir / "settings.json").exists()
+
+    def test_no_menubar_file_completes_without_writing_anything(self, temp_home):
+        switcher = self._switcher(temp_home)
+
+        assert migrations.migrate_menubar_autoswitch_to_settings(switcher) is True
+
+        assert not self._menubar_file(switcher).exists()
+        assert not (switcher.backup_dir / "settings.json").exists()
+
+    def test_a_corrupt_menubar_file_completes_instead_of_retrying_forever(
+        self, temp_home
+    ):
+        switcher = self._switcher(temp_home)
+        self._menubar_file(switcher).write_text("{not json")
+
+        assert migrations.migrate_menubar_autoswitch_to_settings(switcher) is True
+
+    def test_run_migrations_applies_and_records_it(self, temp_home):
+        switcher = self._switcher(temp_home)
+        self._menubar_file(switcher).write_text(
+            json.dumps({"auto_switch_enabled": True})
+        )
+
+        run_migrations(switcher)
+
+        assert load_settings(switcher.backup_dir).background is True
+        # Recorded, so a later `cswap config set autoswitch.background false`
+        # is not silently undone by the migration running a second time.
+        set_setting(switcher.backup_dir, "autoswitch.background", "false")
+        self._menubar_file(switcher).write_text(
+            json.dumps({"auto_switch_enabled": True})
+        )
+        run_migrations(switcher)
+        assert load_settings(switcher.backup_dir).background is False

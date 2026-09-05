@@ -493,10 +493,50 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     return True
 
 
+def migrate_menubar_autoswitch_to_settings(switcher: "ClaudeAccountSwitcher") -> bool:
+    """Move the menu bar's auto-switch toggle into settings.json.
+
+    ``auto_switch_enabled`` was the one policy key in a display-preferences
+    store, reachable only from a rumps menu item — no CLI, no --json, no way to
+    answer "is auto-switch on?" without opening the menu. It now lives in
+    SETTING_SPECS as ``autoswitch.background``.
+
+    Only an explicit ``true`` is carried over; anything else means the operator
+    never asked for a background engine, and the registered default (off) is the
+    correct answer for them. The legacy key is dropped either way, because two
+    writable sources for one switch is the drift this move exists to end.
+    """
+    from claude_swap.settings import set_setting
+
+    path = switcher.backup_dir / "menubar_settings.json"
+    if not path.exists():
+        return True  # nothing to carry over; never look again
+
+    try:
+        stored = json.loads(path.read_text())
+    except (OSError, ValueError):
+        # An unreadable display-preferences file is not worth retrying forever,
+        # and the menu bar rewrites it from defaults on the next toggle anyway.
+        return True
+    if not isinstance(stored, dict) or "auto_switch_enabled" not in stored:
+        return True
+
+    if stored.pop("auto_switch_enabled") is True:
+        set_setting(switcher.backup_dir, "autoswitch.background", "true")
+        switcher._logger.info(
+            "migrated the menu bar auto-switch toggle to autoswitch.background"
+        )
+    # Rewrite without the legacy key. A failure here leaves the migration
+    # unmarked so it retries, which is safe: set_setting is idempotent.
+    path.write_text(json.dumps(stored, indent=2))
+    return True
+
+
 # Registry of (id, fn). Order matters if migrations ever depend on each other.
 MIGRATIONS: list[tuple[str, Callable[["ClaudeAccountSwitcher"], bool]]] = [
     ("windows_keyring_to_files", migrate_windows_keyring_to_files),
     ("macos_keyring_to_security", migrate_macos_keyring_to_security),
+    ("menubar_autoswitch_to_settings", migrate_menubar_autoswitch_to_settings),
 ]
 
 

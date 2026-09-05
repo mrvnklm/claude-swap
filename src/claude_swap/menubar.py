@@ -95,10 +95,11 @@ def ensure_notification_identity(
 class MenuBarSettings:
     """User-configurable menu bar display behavior, persisted as JSON.
 
-    Only display preferences and the auto-switch on/off toggle live here.
-    Auto-switch *policy* (threshold, cooldown, hysteresis, …) is core config,
-    read/written through ``claude_swap.settings`` (the ``autoswitch.*`` keys),
-    so the CLI and the menu bar share one source of truth.
+    Only display preferences live here. Everything about auto-switch —
+    whether it runs at all (``autoswitch.background``) and how it decides
+    (threshold, cooldown, hysteresis, …) — is core config, read/written
+    through ``claude_swap.settings``, so the CLI and the menu bar share one
+    source of truth instead of two files that drift.
     """
 
     show_account_name: bool = True
@@ -110,10 +111,6 @@ class MenuBarSettings:
     # item would have no clickable label at all.
     show_icon: bool = True
     refresh_interval: int = 60
-    # On by default: the menu bar exists to keep switching hands-off, and a
-    # status item that watches an account burn without acting is the state
-    # this tool is for avoiding.
-    auto_switch_enabled: bool = True
     row_style: str = "compact"  # one of ROW_STYLE_CHOICES
     show_resets: bool = False  # second, dimmed line with reset countdowns
 
@@ -1070,6 +1067,13 @@ def run(switcher) -> int:
             # unwanted teardown, and _exit_status turns it into a failure code
             # so launchd's KeepAlive can bring the service back.
             self._quit_intent = False
+            # Whether an engine runs is core config, not a display preference:
+            # `cswap config set autoswitch.background ...` has to reach a
+            # running menu bar, and the menu's checkmark has to show the same
+            # answer the CLI does. Read before rebuild_menu(), which draws it.
+            self._settings_path = switcher.backup_dir / "settings.json"
+            self._settings_mtime = self._settings_stat()
+            self._auto_on = load_settings(switcher.backup_dir).background
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -1078,7 +1082,7 @@ def run(switcher) -> int:
             self.sync_timer = rumps.Timer(self.on_sync_tick, 1)
             self.sync_timer.start()
             self.refresh_async()  # first display fetch
-            if self.settings.auto_switch_enabled:
+            if self._auto_on:
                 self._start_engine()
 
         # ---- display refresh plumbing ----------------------------------------
@@ -1133,8 +1137,56 @@ def run(switcher) -> int:
             if self._dirty:
                 self._dirty = False
                 self.rebuild_menu()
+            self._reconcile_engine()
             self._detect_active_change()
             self._drain_engine_events()
+
+        def _settings_stat(self):
+            try:
+                return self._settings_path.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        def _reconcile_engine(self):
+            """Keep the running engine matching ``autoswitch.background``.
+
+            The liveness half runs every tick and is deliberately NOT behind the
+            mtime gate: an engine thread that dies writes no settings file, so a
+            supervisor that only wakes on a config change would leave it dead —
+            exactly the failure this exists to catch. It costs two attribute
+            comparisons.
+
+            The settings READ is gated on mtime, because it parses a file.
+            Without it, `cswap config set autoswitch.background false` would
+            leave a menu bar switching accounts while both the CLI and the menu
+            said it was off.
+            """
+            if self._auto_on and self._engine is None:
+                self.switcher._logger.warning(
+                    "auto-switch engine is not running but is enabled; restarting"
+                )
+                self._start_engine()
+                self._dirty = True
+
+            mtime = self._settings_stat()
+            if mtime == self._settings_mtime:
+                return
+            self._settings_mtime = mtime
+            try:
+                wanted = load_settings(self.switcher.backup_dir).background
+            except Exception:
+                self.switcher._logger.warning(
+                    "could not re-read settings.json", exc_info=True
+                )
+                return
+            if wanted == self._auto_on:
+                return  # some other key changed
+            self._auto_on = wanted
+            if wanted:
+                self._start_engine()
+            else:
+                self._stop_engine()
+            self._dirty = True
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
@@ -1433,7 +1485,10 @@ def run(switcher) -> int:
             menu.add(interval)
 
             auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
-            auto_item.state = 1 if self.settings.auto_switch_enabled else 0
+            # Intent, deliberately not liveness: a checkmark that goes out
+            # when the engine dies would need two clicks to turn back on,
+            # because the first click reads it as "on" and writes false.
+            auto_item.state = 1 if self._auto_on else 0
             menu.add(auto_item)
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
@@ -1612,9 +1667,19 @@ def run(switcher) -> int:
             return cb
 
         def on_toggle_autoswitch(self, _sender):
-            self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
-            self.settings.save(settings_path)
-            if self.settings.auto_switch_enabled:
+            wanted = not self._auto_on
+            try:
+                set_setting(
+                    self.switcher.backup_dir,
+                    "autoswitch.background",
+                    "true" if wanted else "false",
+                )
+            except Exception as e:
+                rumps.alert(title="claude-swap", message=f"Couldn't save: {e}")
+                return
+            self._auto_on = wanted
+            self._settings_mtime = self._settings_stat()  # our own write
+            if wanted:
                 self._start_engine()
             else:
                 self._stop_engine()
