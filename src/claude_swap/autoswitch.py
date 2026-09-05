@@ -25,6 +25,22 @@ consecutive ticks, the engine fails over to any healthy candidate.
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
 read-modify-write under a dedicated file lock.
+
+SEVERAL MACHINES, ONE POOL. Engines on different machines do not coordinate
+and are not meant to: every state file lives under a per-machine backup root,
+each engine decides alone, and two of them landing on the same account is a
+supported outcome rather than a fault. It follows from the strategy — the
+point of ``consume-first`` is to drain the soonest-expiring account as hard
+as possible before moving on, and two machines drain it twice as fast.
+
+The cost to know about is that each engine measures only the window, not who
+is filling it: shared burn moves the utilization faster than a single engine's
+own traffic would explain, so a threshold tuned for one machine is reached
+later than intended when two are working. The lever is
+``autoswitch.threshold`` (and the per-window overrides) — set for the fleet,
+not for one machine. This was tried the other way, with machines publishing
+claims and excluding each other's accounts; it works against the strategy and
+was removed.
 """
 
 from __future__ import annotations
@@ -45,8 +61,7 @@ from typing import ClassVar
 from claude_swap import oauth, poll_policy, process_detection
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
-from claude_swap import cancellation, host_claim
-from claude_swap.identity import identity_key
+from claude_swap import cancellation
 from claude_swap.cancellation import merge_deadline
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
@@ -1208,38 +1223,13 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
-        # A peer machine's claim removes an account from consideration here,
-        # in the census of what EXISTS, rather than in the ranking — the same
-        # place `quarantined` acts, and for the same reason: it is a statement
-        # about availability, not about which of the available ones is best.
-        #
-        # Fails OPEN. `claimed` is empty when the peer is unreachable, its
-        # claim is stale, or nothing has ever been pulled, so the fleet is
-        # whole again rather than shrinking behind a peer that went away.
-        # Read the files first and only then consult the clock: with no peer
-        # directory — the overwhelmingly common case, and every configuration
-        # that never pulls — this costs one failed glob and no clock read at
-        # all, so the tick's call order is unchanged for them.
-        pulled = host_claim.read_peers(self.switcher.backup_dir)
-        peer_claims = (
-            host_claim.claimed_keys(
-                pulled,
-                now=self.clock(),
-                exclude_host=host_claim.host_name(),
-            )
-            if pulled
-            else {}
-        )
-        identities = self.switcher.account_identities() if peer_claims else {}
-        peer_held = {
-            num
-            for num, ident in identities.items()
-            if identity_key(ident) in peer_claims
-        }
+        # Every switchable account except the active one and any under
+        # quarantine. Machines on a shared pool deliberately do NOT exclude
+        # each other's accounts — see "SEVERAL MACHINES, ONE POOL" above.
         candidates = [
             num
             for num in self.switcher.switchable_account_numbers()
-            if num != current and num not in quarantined and num not in peer_held
+            if num != current and num not in quarantined
         ]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
