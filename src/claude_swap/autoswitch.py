@@ -2618,7 +2618,13 @@ class AutoSwitchEngine:
             self.switcher.backup_dir,
             now=self.clock(),
             next_delay=delay,
-            outcome=getattr(outcome, "value", None) if outcome is not None else None,
+            # The NAME, not the value: TickOutcome values double as exit codes,
+            # so `"outcome": 0` in a status file reads as a number rather than
+            # as SWITCHED.
+            outcome=(
+                None if outcome is None
+                else outcome.name.lower().replace("_", "-")
+            ),  # `is None`, not falsiness: SWITCHED's value is 0
         )
 
     def run_loop(self) -> int:

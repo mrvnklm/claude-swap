@@ -151,3 +151,31 @@ def test_the_age_wording_matches_the_rest_of_the_tool():
 
     for seconds in (0, 45, 59, 60, 599, 3599, 3600, 7980, 86399, 86400, 129600):
         assert heartbeat._ago(seconds) == format_duration(seconds), seconds
+
+
+def test_the_outcome_is_recorded_by_name_not_by_exit_code(tmp_path):
+    """TickOutcome values double as `cswap auto --once` exit codes, so
+    SWITCHED is 0 — a status file saying `"outcome": 0` reads as a number,
+    and a falsiness test on it would write null for the one outcome that
+    matters most."""
+    from claude_swap.autoswitch import AutoSwitchEngine, TickOutcome
+
+    written = {}
+    engine = AutoSwitchEngine.__new__(AutoSwitchEngine)
+    engine.dry_run = False
+    engine.clock = lambda: NOW
+
+    class _Sw:
+        backup_dir = tmp_path
+
+    engine.switcher = _Sw()
+    engine._beat(TickOutcome.SWITCHED, 60.0)
+
+    beat = read_beat(tmp_path)
+    assert beat.outcome == "switched"
+
+    engine._beat(TickOutcome.NO_ACTION, 60.0)
+    assert read_beat(tmp_path).outcome == "no-action"
+
+    engine._beat(None, 60.0)
+    assert read_beat(tmp_path).outcome is None
