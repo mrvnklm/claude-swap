@@ -2098,6 +2098,70 @@ class TestPeersSchedule:
 
         assert launch_agent.PEERS_LABEL != launch_agent.LABEL
 
+    def test_installing_the_schedule_actually_runs(self, temp_home, capsys):
+        """The success path had no test and shipped a NameError on an invented
+        printer function: every case here checked a REJECTED invocation, so the
+        one line that does the work was never executed."""
+        from claude_swap import launch_agent
+
+        installed = {}
+
+        def _fake_install(**kw):
+            installed.update(kw)
+            return {
+                "label": kw["label"], "plist": "/tmp/p.plist",
+                "program": ["cswap"], "stdout_log": "/tmp/o", "stderr_log": "/tmp/e",
+            }
+
+        with patch.object(launch_agent, "install", _fake_install), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", [
+                 "claude-swap", "peers", "pull", "mac-studio", "--install-service"
+             ]):
+            cli.main()
+
+        assert installed["label"] == launch_agent.PEERS_LABEL
+        assert installed["args"] == ("peers", "pull", "mac-studio")
+        assert installed["start_interval"] == launch_agent.PEERS_INTERVAL_S
+        assert "mac-studio" in capsys.readouterr().out
+
+    def test_uninstalling_the_schedule_actually_runs(self, temp_home, capsys):
+        from claude_swap import launch_agent
+
+        seen = {}
+
+        def _fake_uninstall(**kw):
+            seen.update(kw)
+            return {"label": kw["label"], "was_loaded": True, "removed_plist": True}
+
+        with patch.object(launch_agent, "uninstall", _fake_uninstall), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv",
+                          ["claude-swap", "peers", "--uninstall-service"]):
+            cli.main()
+
+        assert seen["label"] == launch_agent.PEERS_LABEL
+        assert "removed" in capsys.readouterr().out.lower()
+
+    def test_a_custom_interval_is_honoured(self, temp_home, capsys):
+        from claude_swap import launch_agent
+
+        installed = {}
+        with patch.object(
+            launch_agent, "install",
+            lambda **kw: installed.update(kw) or {
+                "label": kw["label"], "plist": "/tmp/p", "program": [],
+                "stdout_log": "/tmp/o", "stderr_log": "/tmp/e",
+            },
+        ), patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", [
+                 "claude-swap", "peers", "pull", "h", "--install-service",
+                 "--interval", "60",
+             ]):
+            cli.main()
+
+        assert installed["start_interval"] == 60
+
     @pytest.mark.parametrize("argv", [
         ["peers", "--install-service"],              # no hosts
         ["peers", "show", "--install-service"],      # wrong action

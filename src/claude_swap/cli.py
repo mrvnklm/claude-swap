@@ -1293,9 +1293,9 @@ stops being counted, and every account becomes a candidate again.
         if args.uninstall_service:
             result = launch_agent.uninstall(label=launch_agent.PEERS_LABEL)
             if result["was_loaded"] or result["removed_plist"]:
-                success("Scheduled peer pull removed")
+                print("Scheduled peer pull removed.")
             else:
-                print(dimmed("No scheduled peer pull was installed"))
+                print("Scheduled peer pull was not installed.")
             return
 
         if args.install_service:
@@ -1305,10 +1305,14 @@ stops being counted, and every account becomes a candidate again.
                 args=("peers", "pull", *args.hosts),
                 start_interval=interval,
             )
-            success(f"Pulling {', '.join(args.hosts)} every {interval}s")
-            print(dimmed(f"  {result['plist']}"))
+            print(
+                f"Scheduled peer pull installed ({result['label']}): "
+                f"{', '.join(args.hosts)} every {interval}s."
+            )
+            print(f"  plist: {result['plist']}")
+            print(f"  logs:  {result['stderr_log']}")
             print(dimmed(
-                "  ssh must work without a passphrase prompt from a launchd "
+                "ssh must work without a passphrase prompt from a launchd "
                 "job — an agent has no terminal to ask on."
             ))
             return
