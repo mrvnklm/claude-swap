@@ -1234,6 +1234,37 @@ class TestWatchScreen:
                 f"{still} under it"
             )
 
+    async def test_the_watch_title_says_when_no_engine_is_running(self, tmp_path):
+        """This screen was open for 36 hours during an outage: correctly
+        ordered rows, fresh usage, and not one word about the fact that
+        nothing was deciding anything."""
+        from claude_swap.settings import set_setting
+
+        set_setting(tmp_path, "autoswitch.background", "true")
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            title = app.screen.query_one("#list-title", Static)
+            assert "auto-switch is enabled" in title.render().plain
+
+    async def test_the_watch_title_is_quiet_when_no_engine_was_asked_for(
+        self, tmp_path
+    ):
+        """The shipped default runs no engine; that must not read as a fault."""
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            title = app.screen.query_one("#list-title", Static)
+            assert "auto-switch" not in title.render().plain
+
     async def test_escape_disarms_then_leaves(self, tmp_path):
         fake = self._fake(tmp_path)
         app = make_app(fake)

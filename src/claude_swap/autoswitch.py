@@ -54,6 +54,7 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
+from claude_swap import heartbeat
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
@@ -2609,8 +2610,22 @@ class AutoSwitchEngine:
         except Exception:
             return delay
 
+    def _beat(self, outcome, delay: float) -> None:
+        """Record that the loop turned. Never raises, never runs dry."""
+        if self.dry_run:
+            return  # a dry run must leave no trace on disk
+        heartbeat.write_beat(
+            self.switcher.backup_dir,
+            now=self.clock(),
+            next_delay=delay,
+            outcome=getattr(outcome, "value", None) if outcome is not None else None,
+        )
+
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        # A start beat, so a loop whose very first tick hangs is still visibly
+        # a running engine rather than one that never reported in.
+        self._beat(None, self.settings.interval_seconds)
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
@@ -2626,6 +2641,12 @@ class AutoSwitchEngine:
                 )
                 outcome = TickOutcome.ERROR
             delay = self._next_delay(outcome)
+            # Exactly one beat per iteration, with the delay actually about to
+            # be slept, so the deadline a reader checks is the writer's own
+            # promise. `cswap auto --once` never reaches here and writes
+            # nothing: a cron wrapper must not keep a dead long-running
+            # engine's file looking alive.
+            self._beat(outcome, delay)
             if delay > self.settings.interval_seconds * 1.5:
                 until = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 self._emit(

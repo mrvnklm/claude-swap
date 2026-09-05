@@ -5588,6 +5588,26 @@ class ClaudeAccountSwitcher:
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
+        # Engine liveness. Silent unless the operator asked for a background
+        # engine and it is not reporting in — `cswap list` is the command
+        # someone runs when switching "stopped working", and it used to show
+        # perfectly fresh usage while nothing was deciding anything, because
+        # this very call refreshes the shared store.
+        try:
+            from claude_swap import heartbeat
+            from claude_swap.settings import load_settings
+
+            line = heartbeat.describe(
+                self.backup_dir,
+                expected=load_settings(self.backup_dir).background,
+                now=time.time(),
+            )
+            if line:
+                print()
+                warning(line)
+        except Exception:
+            self._logger.debug("Failed to read engine heartbeat", exc_info=True)
+
     def _active_account_usage(
         self, account_num: str, current_email: str, org_uuid: str
     ) -> UsageEntry:
