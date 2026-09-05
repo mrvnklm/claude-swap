@@ -2050,3 +2050,63 @@ class TestPeersPull:
         assert code == 1
         switcher = ClaudeAccountSwitcher()
         assert host_claim.read_peers(switcher.backup_dir) == []
+
+
+class TestPeersSchedule:
+    """A claim only excludes an account once it has been PULLED, so without a
+    schedule the whole mechanism is inert — which is exactly how it shipped."""
+
+    def test_the_plist_runs_the_pull_periodically(self, tmp_path):
+        import plistlib
+
+        from claude_swap import launch_agent
+
+        raw = launch_agent.build_plist(
+            program=["/opt/cswap"],
+            label=launch_agent.PEERS_LABEL,
+            home=tmp_path,
+            args=("peers", "pull", "mac-studio"),
+            start_interval=300,
+        )
+        plist = plistlib.loads(raw)
+
+        assert plist["ProgramArguments"] == [
+            "/opt/cswap", "peers", "pull", "mac-studio"
+        ]
+        assert plist["StartInterval"] == 300
+        # A periodic job exits every run. KeepAlive would read that as a crash
+        # and relaunch it immediately, ignoring the interval.
+        assert "KeepAlive" not in plist
+        assert plist["ProcessType"] == "Background"
+
+    def test_the_menubar_plist_is_unchanged_by_that(self, tmp_path):
+        import plistlib
+
+        from claude_swap import launch_agent
+
+        plist = plistlib.loads(
+            launch_agent.build_plist(program=["/opt/cswap"], home=tmp_path)
+        )
+
+        assert plist["ProgramArguments"] == ["/opt/cswap", "menubar"]
+        assert plist["KeepAlive"] == {"SuccessfulExit": False}
+        assert plist["ProcessType"] == "Interactive"
+        assert "StartInterval" not in plist
+
+    def test_the_two_agents_do_not_share_a_label(self):
+        from claude_swap import launch_agent
+
+        assert launch_agent.PEERS_LABEL != launch_agent.LABEL
+
+    @pytest.mark.parametrize("argv", [
+        ["peers", "--install-service"],              # no hosts
+        ["peers", "show", "--install-service"],      # wrong action
+        ["peers", "pull", "h", "--interval", "10"],  # interval without install
+        ["peers", "pull", "h", "--install-service", "--interval", "5"],  # too fast
+        ["peers", "pull", "h", "--install-service", "--uninstall-service"],
+    ])
+    def test_incoherent_invocations_are_refused(self, argv, capsys):
+        with patch.object(sys, "argv", ["claude-swap", *argv]):
+            with pytest.raises(SystemExit) as e:
+                cli.main()
+        assert e.value.code != 0

@@ -38,6 +38,18 @@ from claude_swap.exceptions import ClaudeSwitchError
 
 LABEL = "com.cswap.menubar"
 
+# The peer-claim pull. A separate agent rather than a thread inside the menu
+# bar, because this package holds locks across decisions and must hold none
+# across a network call — the engine only ever reads what is already on disk.
+PEERS_LABEL = "com.cswap.peers"
+
+# How often to fetch the peers' claims. The window matters because a claim only
+# excludes an account once it has been pulled: at 5 minutes, two machines can
+# both pick the same account for at most that long before one of them sees the
+# other. Measured cost of one pull on this fleet: ~0.3s of ssh, and the engine
+# ticks every 60s, so this is far cheaper than the collision it prevents.
+PEERS_INTERVAL_S = 300
+
 # launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin, which covers
 # `security` (Keychain reads) but not a Homebrew or ~/.local/bin `claude`. The
 # menu bar shells out to detect running sessions, so seed a PATH that finds it.
@@ -123,32 +135,43 @@ def build_plist(
     program: list[str] | None = None,
     label: str = LABEL,
     home: Path | None = None,
+    args: tuple[str, ...] = ("menubar",),
+    start_interval: int | None = None,
 ) -> bytes:
     """Serialize the LaunchAgent plist.
 
     Built with :mod:`plistlib` rather than a formatted XML string so paths
     containing ``&`` or ``<`` cannot produce a plist launchd refuses to parse.
+
+    ``start_interval`` makes it a periodic job instead of a long-running one,
+    which is a different contract: the process is expected to exit, so
+    ``KeepAlive`` would fight launchd rather than help it.
     """
     program = program or resolve_program()
     out_log, err_log = log_paths(label, home)
-    return plistlib.dumps(
-        {
-            "Label": label,
-            "ProgramArguments": [*program, "menubar"],
-            "RunAtLoad": True,
-            # Restart a crash, but respect a deliberate Quit. The menu bar's
-            # quit handler calls rumps.quit_application(), a clean exit(0);
-            # under a bare `KeepAlive: True` launchd would relaunch it at once
-            # and the Quit item would do nothing the user can see.
-            "KeepAlive": {"SuccessfulExit": False},
-            # A menu bar owner is a UI process; Background would have launchd
-            # apply throttled I/O and CPU bands to it.
-            "ProcessType": "Interactive",
-            "EnvironmentVariables": {"PATH": _path_env(program)},
-            "StandardOutPath": str(out_log),
-            "StandardErrorPath": str(err_log),
-        }
-    )
+    plist: dict = {
+        "Label": label,
+        "ProgramArguments": [*program, *args],
+        "RunAtLoad": True,
+        "EnvironmentVariables": {"PATH": _path_env(program)},
+        "StandardOutPath": str(out_log),
+        "StandardErrorPath": str(err_log),
+    }
+    if start_interval is not None:
+        plist["StartInterval"] = int(start_interval)
+        # A periodic job exits every run; KeepAlive would treat that as a
+        # crash and relaunch it in a loop, ignoring the interval entirely.
+        plist["ProcessType"] = "Background"
+    else:
+        # Restart a crash, but respect a deliberate Quit. The menu bar's
+        # quit handler calls rumps.quit_application(), a clean exit(0);
+        # under a bare `KeepAlive: True` launchd would relaunch it at once
+        # and the Quit item would do nothing the user can see.
+        plist["KeepAlive"] = {"SuccessfulExit": False}
+        # A menu bar owner is a UI process; Background would have launchd
+        # apply throttled I/O and CPU bands to it.
+        plist["ProcessType"] = "Interactive"
+    return plistlib.dumps(plist)
 
 
 def _launchctl(*args: str) -> subprocess.CompletedProcess:
@@ -219,6 +242,8 @@ def install(
     home: Path | None = None,
     program: list[str] | None = None,
     uid: int | None = None,
+    args: tuple[str, ...] = ("menubar",),
+    start_interval: int | None = None,
 ) -> dict:
     """Write the plist and hand the service to launchd.
 
@@ -233,7 +258,9 @@ def install(
 
     target_plist.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
-    target_plist.write_bytes(build_plist(program, label, home))
+    target_plist.write_bytes(
+        build_plist(program, label, home, args, start_interval)
+    )
 
     settled = True
     if is_loaded(label, uid):
@@ -253,7 +280,7 @@ def install(
     return {
         "label": label,
         "plist": str(target_plist),
-        "program": [*program, "menubar"],
+        "program": [*program, *args],
         "stdout_log": str(out_log),
         "stderr_log": str(err_log),
     }

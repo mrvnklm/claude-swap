@@ -59,7 +59,7 @@ import json
 import os
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -109,6 +109,13 @@ class Claim:
     # before this field existed) — such a claim cannot be dated and is
     # therefore not live.
     pulled_at: float | None = None
+    # The name WE pulled this file under (its stem in peer_claims/), which is
+    # not the same as the name the peer reports for itself. When those two
+    # disagree and the self-reported one happens to match ours, the claim is
+    # silently dropped by `exclude_host` — a hostname collision that would
+    # otherwise make the whole mechanism inert with no signal at all. Two
+    # machines called "Mac" is not far-fetched; one of this fleet's is.
+    source: str | None = None
 
     @property
     def standing_s(self) -> float:
@@ -246,7 +253,7 @@ def read_peers(backup_dir: Path) -> list[Claim]:
             continue
         claim = _parse(raw)
         if claim is not None:
-            claims.append(claim)
+            claims.append(replace(claim, source=path.stem))
     return claims
 
 

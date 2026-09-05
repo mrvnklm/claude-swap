@@ -1203,7 +1203,7 @@ def _peers_command(argv: list[str]) -> None:
     """
     import subprocess
 
-    from claude_swap import host_claim
+    from claude_swap import host_claim, launch_agent
 
     parser = argparse.ArgumentParser(
         prog="cswap peers",
@@ -1218,6 +1218,13 @@ Examples:
   cswap peers                       # what this machine knows about the others
   cswap peers pull mac-studio       # fetch one machine's claim over ssh
   cswap peers show                  # print this machine's own claim (used by pull)
+  cswap peers pull mac-studio --install-service
+                                    # keep fetching it on a schedule (macOS)
+  cswap peers --uninstall-service   # stop the scheduled fetch
+
+A claim only excludes an account once it has been PULLED, so without a
+schedule this mechanism does nothing at all. Install the service on both
+machines, each naming the other.
 
 Claims carry an account identity, a timestamp and a session count — never a
 token or a credential. A peer that is unreachable or has gone quiet simply
@@ -1228,8 +1235,43 @@ stops being counted, and every account becomes a candidate again.
     parser.add_argument("hosts", nargs="*", metavar="HOST")
     parser.add_argument("--json", action="store_true", help="Machine-readable output")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--install-service",
+        action="store_true",
+        help=(
+            "With 'pull': install a launchd LaunchAgent that pulls those "
+            "hosts' claims on a schedule (macOS)"
+        ),
+    )
+    parser.add_argument(
+        "--uninstall-service",
+        action="store_true",
+        help="Stop the scheduled pull and remove its plist (macOS)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "With --install-service: seconds between pulls "
+            f"(default {launch_agent.PEERS_INTERVAL_S})"
+        ),
+    )
     args = parser.parse_args(argv)
 
+    if args.install_service and args.uninstall_service:
+        parser.error("--install-service and --uninstall-service are exclusive")
+    if args.install_service and (args.action != "pull" or not args.hosts):
+        parser.error("--install-service needs: cswap peers pull HOST [HOST...]")
+    if args.uninstall_service and (args.action or args.hosts):
+        parser.error("--uninstall-service takes no action or HOST")
+    if args.interval is not None and not args.install_service:
+        parser.error("--interval is only used with --install-service")
+    if args.interval is not None and args.interval < 30:
+        # Below this the ssh round trip starts to dominate, and a claim only
+        # moves when a machine switches — far less often than every 30s.
+        parser.error("--interval must be at least 30 seconds")
     if args.action != "pull" and args.hosts:
         parser.error("HOST is only used with 'pull'")
     if args.action == "pull" and not args.hosts:
@@ -1246,6 +1288,29 @@ stops being counted, and every account becomes a candidate again.
                 error("No claim published yet — this machine has not switched.")
                 sys.exit(1)
             print(path.read_text(encoding="utf-8").strip())
+            return
+
+        if args.uninstall_service:
+            result = launch_agent.uninstall(label=launch_agent.PEERS_LABEL)
+            if result["was_loaded"] or result["removed_plist"]:
+                success("Scheduled peer pull removed")
+            else:
+                print(dimmed("No scheduled peer pull was installed"))
+            return
+
+        if args.install_service:
+            interval = args.interval or launch_agent.PEERS_INTERVAL_S
+            result = launch_agent.install(
+                label=launch_agent.PEERS_LABEL,
+                args=("peers", "pull", *args.hosts),
+                start_interval=interval,
+            )
+            success(f"Pulling {', '.join(args.hosts)} every {interval}s")
+            print(dimmed(f"  {result['plist']}"))
+            print(dimmed(
+                "  ssh must work without a passphrase prompt from a launchd "
+                "job — an agent has no terminal to ask on."
+            ))
             return
 
         if args.action == "pull":
@@ -1315,7 +1380,16 @@ stops being counted, and every account becomes a candidate again.
         for c in sorted(claims, key=lambda c: c.host):
             org = c.key.rsplit(":", 1)[-1][:8]
             if c.host == me:
-                note = muted("this machine — never excluded")
+                # Either a synced (rather than pulled) directory, which is
+                # intended, or two machines that report the same hostname —
+                # in which case each silently ignores the other and the whole
+                # mechanism is inert. The source name tells them apart.
+                note = muted(
+                    f"self-reports as {me!r}, this machine's own name "
+                    "— not excluded"
+                    if c.source and c.source != me
+                    else "this machine — never excluded"
+                )
             elif c.key in excluded:
                 note = f"held ({_since_pull(c, now)})"
             elif c.stale_s(now) is None:

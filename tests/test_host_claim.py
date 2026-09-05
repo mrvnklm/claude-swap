@@ -252,3 +252,35 @@ class TestEndToEndAgainstARealRecord:
         assert host_claim.claimed_keys(
             host_claim.read_peers(tmp_path), now=late
         ) != {}
+
+
+class TestHostnameCollision:
+    """Two machines reporting the same hostname make every claim drop out via
+    exclude_host, and the mechanism goes inert with nothing said. One of this
+    fleet's machines calls itself "Mac", so this is not hypothetical."""
+
+    def test_a_pulled_claim_remembers_what_we_pulled_it_as(self, tmp_path):
+        record = host_claim.build_claim(
+            _ident(), since=NOW, now=NOW, busy_sessions=1, host="Mac"
+        )
+        host_claim.write_peer_claim(
+            tmp_path, "mac-studio", json.dumps(record), now=NOW
+        )
+        claim = host_claim.read_peers(tmp_path)[0]
+
+        assert claim.source == "mac-studio", "the name we fetched it under"
+        assert claim.host == "Mac", "the name it reports for itself"
+
+    def test_a_colliding_name_still_drops_the_claim(self, tmp_path):
+        """The drop itself is correct — a machine must never exclude the
+        account it is using. What was missing is any way to see it happened."""
+        record = host_claim.build_claim(
+            _ident(), since=NOW, now=NOW, busy_sessions=1, host="Mac"
+        )
+        host_claim.write_peer_claim(
+            tmp_path, "mac-studio", json.dumps(record), now=NOW
+        )
+        pulled = host_claim.read_peers(tmp_path)
+
+        assert host_claim.claimed_keys(pulled, now=NOW, exclude_host="Mac") == {}
+        assert host_claim.claimed_keys(pulled, now=NOW, exclude_host="other") != {}
