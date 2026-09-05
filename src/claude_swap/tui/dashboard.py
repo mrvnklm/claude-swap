@@ -17,6 +17,7 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
+import logging
 import time
 
 from functools import partial
@@ -32,6 +33,8 @@ from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
+
+_logger = logging.getLogger("claude-swap")
 
 FLASH_S = 1.5  # how long a just-refreshed row stays highlighted
 
@@ -248,7 +251,17 @@ class AccountListScreen(Screen):
         numbers = [acc.number for acc in rows]
         if numbers != self._numbers:
             first_build = not self._numbers
-            previous = listview.index
+            # The account under the cursor, not its position: this list
+            # re-sorts whenever usage moves, so a remembered index points at
+            # whoever drifted into that slot. Preserving the index is how an
+            # ordinary refresh could slide a different account under an armed
+            # cursor and have Enter switch to it.
+            previous = None
+            if listview.index is not None and self._numbers:
+                try:
+                    previous = self._numbers[listview.index]
+                except IndexError:
+                    previous = None
             await listview.clear()
             await listview.extend(AccountItem(acc) for acc in rows)
             self._numbers = numbers
@@ -263,22 +276,38 @@ class AccountListScreen(Screen):
         self._flash_updated(snap, listview)
 
     def _index_after_build(
-        self, snap: AccountsSnapshot, first_build: bool, previous: int | None
+        self, snap: AccountsSnapshot, first_build: bool, previous: str | None
     ) -> int | None:
-        """Where the cursor lands after the list is (re)built."""
+        """Where the cursor lands after the list is (re)built.
+
+        ``previous`` is the account number that was under the cursor, not its
+        row index — see the note in :meth:`_on_snapshot`.
+        """
         if first_build:
             return self._active_index(snap)
-        return min(previous or 0, len(snap.accounts) - 1)
+        if previous is not None:
+            index = self._index_of(snap, previous)
+            if index is not None:
+                return index
+        return 0  # the account is gone (removed, or newly disabled off the list)
 
-    def _active_index(self, snap: AccountsSnapshot) -> int:
+    def _index_of(self, snap: AccountsSnapshot, number: str) -> int | None:
+        """Row index of an account in the RENDERED order, or None."""
         return next(
             (
                 i
-                for i, acc in enumerate(snap.accounts)
-                if acc.number == snap.active_number
+                for i, acc in enumerate(self._ordered(snap))
+                if acc.number == number
             ),
-            0,
+            None,
         )
+
+    def _active_index(self, snap: AccountsSnapshot) -> int:
+        # Indexes the rendered order, not snap.accounts: a screen that sorts
+        # (the watch view does) would otherwise arm the cursor on whichever
+        # account happens to sit at the active one's sequence position.
+        index = self._index_of(snap, snap.active_number)
+        return 0 if index is None else index  # not `or 0`: index 0 is falsy
 
     def _flash_updated(self, snap: AccountsSnapshot, listview: ListView) -> None:
         """Briefly highlight rows whose stored measurement just advanced."""
@@ -371,7 +400,14 @@ class WatchScreen(AccountListScreen):
         try:
             settings = load_settings(self.app.switcher.backup_dir)
             return data.in_switch_order(list(snap.accounts), settings, time.time())
-        except Exception:  # pragma: no cover - display must never fail closed
+        except Exception:
+            # Display must never fail closed, but it must not fail SILENTLY
+            # either: the menu bar's twin swallowed a NameError for a day,
+            # rendering plain sequence order while every signal read green.
+            # Falling back is correct; saying nothing about it is not.
+            _logger.warning(
+                "could not order accounts by switch order", exc_info=True
+            )
             return list(snap.accounts)
 
     def __init__(self) -> None:

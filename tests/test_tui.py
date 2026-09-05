@@ -48,6 +48,7 @@ def make_entry(
     age_s: float = 5.0,
     scoped: list[tuple[str, float]] | None = None,
     spend: dict | None = None,
+    weekly_in: float | None = None,
 ) -> UsageEntry:
     """``pct5``/``pct7`` of None omit that window (e.g. annual plans lack 7d)."""
     if sentinel is not None:
@@ -56,7 +57,10 @@ def make_entry(
     if pct5 is not None:
         last_good["five_hour"] = {"pct": pct5, "resets_at": _iso_in(7200)}
     if pct7 is not None:
-        last_good["seven_day"] = {"pct": pct7, "resets_at": _iso_in(86400 * 3)}
+        last_good["seven_day"] = {
+            "pct": pct7,
+            "resets_at": _iso_in(86400 * 3 if weekly_in is None else weekly_in),
+        }
     if scoped is not None:
         last_good["scoped"] = [
             {"name": name, "pct": pct, "resets_at": _iso_in(86400 * 2)}
@@ -1142,6 +1146,94 @@ class TestWatchScreen:
             assert app.screen.query_one("#accounts", ListView).index is None
             assert app.snapshot.active_number == "2"
 
+    async def test_arming_puts_the_cursor_on_the_account_it_highlights(
+        self, tmp_path
+    ):
+        """`s` armed the cursor at the active account's SEQUENCE position while
+        the list renders in switch order, so it landed on a different account —
+        and Enter switched to that one. The two orders only diverge when the
+        active account is not first in sequence, which is why the existing
+        two-account case never caught it.
+        """
+        fake = FakeSwitcher(
+            [
+                make_account(1, entry=make_entry(10.0, 10.0)),
+                make_account(2, active=True, entry=make_entry(20.0, 20.0)),
+                make_account(3, entry=make_entry(30.0, 30.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            from claude_swap.tui.widgets import AccountItem
+
+            listview = app.screen.query_one("#accounts", ListView)
+            rows = [it.number for it in listview.query(AccountItem)]
+            assert rows[0] == "2", "the active account renders first"
+            highlighted = list(listview.query(AccountItem))[listview.index]
+            assert highlighted.number == "2", (
+                f"cursor armed on account {highlighted.number}, not the active one"
+            )
+
+            await pilot.press("enter")
+            await settle(pilot)
+            assert ("switch_to", "2") in fake.calls
+
+    async def test_a_refresh_does_not_move_a_different_account_under_the_cursor(
+        self, tmp_path
+    ):
+        """The list re-sorts on every refresh and the cursor was preserved by
+        INDEX, so an ordinary refresh could slide a different account under it
+        without the operator touching a key. Enter then switches to that one.
+        """
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(10.0, 10.0)),
+                make_account(2, entry=make_entry(20.0, 20.0)),
+                make_account(3, entry=make_entry(30.0, 30.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            from claude_swap.tui.widgets import AccountItem
+
+            listview = app.screen.query_one("#accounts", ListView)
+            await pilot.press("down")
+            await pilot.pause()
+            armed = list(listview.query(AccountItem))[listview.index].number
+
+            # Account 2 burns past 3: the switch order swaps them under the
+            # cursor. Nothing the operator did.
+            fake._accounts = [
+                make_account(1, active=True, entry=make_entry(10.0, 10.0)),
+                make_account(2, entry=make_entry(95.0, 95.0)),
+                make_account(3, entry=make_entry(30.0, 30.0)),
+            ]
+            app.request_refresh()
+            await settle(pilot)
+
+            listview = app.screen.query_one("#accounts", ListView)
+            still = list(listview.query(AccountItem))[listview.index].number
+            assert still == armed, (
+                f"cursor was on account {armed}, a refresh moved account "
+                f"{still} under it"
+            )
+
     async def test_escape_disarms_then_leaves(self, tmp_path):
         fake = self._fake(tmp_path)
         app = make_app(fake)
@@ -1710,3 +1802,82 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+# ---------------------------------------------------------------------------
+# in_switch_order — the ranking the watch view and the menu bar both render
+# ---------------------------------------------------------------------------
+
+
+class TestInSwitchOrder:
+    """Six mutations of this function — including replacing it with the
+    identity — used to leave the whole suite green, so the feature that was
+    written to stop dying silently could itself die silently."""
+
+    @staticmethod
+    def _settings(**kw):
+        from claude_swap.settings import AutoSwitchSettings
+
+        return AutoSwitchSettings(**kw)
+
+    def _order(self, accounts, settings, now=None):
+        return [
+            a.number
+            for a in tui_data.in_switch_order(
+                accounts, settings, time.time() if now is None else now
+            )
+        ]
+
+    def test_the_active_account_is_first_and_the_rest_rank_by_headroom(self):
+        accounts = [
+            make_account(1, entry=make_entry(80.0, 80.0)),
+            make_account(2, active=True, entry=make_entry(50.0, 50.0)),
+            make_account(3, entry=make_entry(10.0, 10.0)),
+        ]
+        assert self._order(accounts, self._settings()) == ["2", "3", "1"]
+
+    def test_consume_first_drains_the_soonest_weekly_reset_not_the_emptiest(self):
+        """The two strategies must disagree here, or the test proves nothing:
+        account 1 has LESS headroom but its weekly window resets sooner, so
+        only the consume-first key can put it ahead of account 3."""
+        accounts = [
+            make_account(1, entry=make_entry(70.0, 70.0, weekly_in=6 * 3600)),
+            make_account(2, active=True, entry=make_entry(50.0, 50.0)),
+            make_account(3, entry=make_entry(10.0, 10.0, weekly_in=6 * 86400)),
+        ]
+        assert self._order(accounts, self._settings()) == ["2", "3", "1"]
+        assert self._order(
+            accounts, self._settings(strategy="consume-first")
+        ) == ["2", "1", "3"]
+
+    def test_a_reading_the_engine_calls_unknown_does_not_outrank_a_known_one(self):
+        """It ranks on decision_value(), which drops a stale measurement — the
+        menu bar's twin used last_good and would put this account first."""
+        accounts = [
+            make_account(1, entry=make_entry(5.0, 5.0, age_s=86_400.0)),
+            make_account(2, active=True, entry=make_entry(50.0, 50.0)),
+            make_account(3, entry=make_entry(40.0, 40.0)),
+        ]
+        order = self._order(accounts, self._settings())
+        assert order[0] == "2"
+        assert order.index("3") < order.index("1"), (
+            "a 5%-but-unknown account must not outrank a known 40% one"
+        )
+
+    def test_accounts_held_out_of_rotation_sort_to_the_end(self):
+        accounts = [
+            make_account(1, disabled=True, entry=make_entry(1.0, 1.0)),
+            make_account(2, active=True, entry=make_entry(50.0, 50.0)),
+            make_account(3, entry=make_entry(90.0, 90.0)),
+        ]
+        assert self._order(accounts, self._settings()) == ["2", "3", "1"]
+
+    def test_every_account_is_rendered_exactly_once(self):
+        """A reorder that drops or duplicates a row is worse than no reorder."""
+        accounts = [
+            make_account(1, entry=make_entry(80.0, 80.0)),
+            make_account(2, active=True, entry=make_entry(50.0, 50.0)),
+            make_account(3, disabled=True, entry=make_entry(10.0, 10.0)),
+            make_account(4, entry=make_entry(20.0, 20.0)),
+        ]
+        order = self._order(accounts, self._settings())
+        assert sorted(order) == ["1", "2", "3", "4"]
