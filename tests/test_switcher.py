@@ -1091,6 +1091,68 @@ class TestLiveSessionGuardOnAnUnreadableRecord:
         switcher._ensure_no_live_session("2", "test@example.com", "the operation")
 
 
+class TestListAccountsEngineLiveness:
+    """`cswap list` is what someone runs when switching "stopped working", and
+    it used to answer with perfectly fresh usage — because the call itself
+    refreshes the shared store — while no engine had been running for 36
+    hours."""
+
+    @staticmethod
+    def _switcher(temp_home: Path, sample_sequence_data: dict):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    def test_a_dead_engine_is_reported(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys,
+    ):
+        from claude_swap import heartbeat
+        from claude_swap.settings import set_setting
+
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        set_setting(switcher.backup_dir, "autoswitch.background", "true")
+        heartbeat.write_beat(
+            switcher.backup_dir,
+            now=time.time() - 36 * 3600,
+            next_delay=60.0,
+            outcome="no-action",
+        )
+
+        switcher.list_accounts()
+
+        assert "auto-switch is enabled" in capsys.readouterr().out
+
+    def test_a_healthy_engine_says_nothing(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys,
+    ):
+        from claude_swap import heartbeat
+        from claude_swap.settings import set_setting
+
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        set_setting(switcher.backup_dir, "autoswitch.background", "true")
+        heartbeat.write_beat(
+            switcher.backup_dir, now=time.time(), next_delay=60.0, outcome="no-action"
+        )
+
+        switcher.list_accounts()
+
+        assert "auto-switch is enabled" not in capsys.readouterr().out
+
+    def test_it_is_silent_for_anyone_who_runs_no_engine(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        capsys,
+    ):
+        """The shipped default. Never nag someone who did not ask for one."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+
+        switcher.list_accounts()
+
+        assert "auto-switch" not in capsys.readouterr().out
+
+
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
