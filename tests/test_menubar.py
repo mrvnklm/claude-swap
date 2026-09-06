@@ -628,9 +628,15 @@ def test_table_model_columns_are_shared_and_deduplicated():
 
 
 def test_table_rows_carry_only_numbers():
+    # The leading cell is the active marker plus the slot number; every other
+    # cell is a bare measurement, because the window columns are right-aligned
+    # and prose dropped into one would run backwards across the row.
     rows = menubar.build_account_table(_TABLE_ACCOUNTS)
-    assert rows[0].cells == ("1", "a@x.de", "0%", "91%", "90%", "")
-    assert rows[1].cells == ("2", "b@x.de", "19%", "3%", "0%", "58%")
+    pad = menubar.INACTIVE_MARKER
+    assert rows[0].cells == (pad + "1", "a@x.de", "0%", "91%", "90%", "")
+    assert rows[1].cells == (
+        menubar.ACTIVE_MARKER + "2", "b@x.de", "19%", "3%", "0%", "58%"
+    )  # account 2 is the active one in this fixture
 
 
 def test_table_row_keeps_grid_width_when_a_window_is_missing():
@@ -1413,3 +1419,45 @@ class TestActiveRowEmphasis:
         menubar._emphasise_active(AppKit, row)
         bold, _ = self._attrs_at(row, 0)
         assert bold is False
+
+
+class TestActiveMarker:
+    """Weight alone was not findable: at the menu font size a bold row in a
+    list of eight does not stand out, which is the one job the mark has."""
+
+    @staticmethod
+    def _accounts(active="6"):
+        lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
+        return [
+            (n, f"a{n}@example.com", n == active, lg, lg, "", False, None)
+            for n in ("1", "6", "9")
+        ]
+
+    def test_exactly_one_row_carries_the_marker(self):
+        rows = menubar.build_account_table(self._accounts())
+        marked = [r for r in rows if r.cells[0].startswith(menubar.ACTIVE_MARKER)]
+        assert len(marked) == 1
+        assert marked[0].cells[0] == menubar.ACTIVE_MARKER + "6"
+
+    def test_inactive_rows_are_padded_not_bare(self):
+        """A bare number on the inactive rows would shunt the active row
+        sideways and break the column the slot numbers live in."""
+        rows = menubar.build_account_table(self._accounts())
+        for row in rows:
+            assert len(row.cells[0]) == 2, row.cells[0]
+            assert row.cells[0][0] in (menubar.ACTIVE_MARKER, menubar.INACTIVE_MARKER)
+
+    def test_the_slot_number_survives_the_marker(self):
+        rows = menubar.build_account_table(self._accounts())
+        assert [r.cells[0][1:] for r in rows] == ["1", "6", "9"]
+
+    def test_the_focus_style_marks_it_too(self):
+        rows = menubar.build_focus_table(self._accounts())
+        marked = [r for r in rows if r.cells[0].startswith(menubar.ACTIVE_MARKER)]
+        assert len(marked) == 1
+
+    def test_a_sentinel_row_is_still_marked_when_active(self):
+        """An account that cannot report usage is still where you are."""
+        accounts = [("3", "a@b.c", True, "re-login needed", None, "", False, None)]
+        rows = menubar.build_account_table(accounts)
+        assert rows[0].cells[0].startswith(menubar.ACTIVE_MARKER)
