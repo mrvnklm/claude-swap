@@ -1385,11 +1385,13 @@ class TestActiveRowEmphasis:
         ) if font is not None else False
         return bold, colour
 
-    def test_the_name_is_emphasised(self):
+    def test_the_name_is_emphasised_by_weight_alone(self):
+        """No colour: an accent-coloured row reads as a link rather than as
+        "you are here", and it competes with the warning colours beside it."""
         out = menubar._emphasise_active(AppKit, self._row())
         bold, colour = self._attrs_at(out, 0)
         assert bold is True
-        assert colour == AppKit.NSColor.controlAccentColor()
+        assert colour != AppKit.NSColor.controlAccentColor()
 
     def test_a_warning_percentage_keeps_its_own_colour(self):
         """The reading the operator most needs to see must not be repainted by
@@ -1406,9 +1408,8 @@ class TestActiveRowEmphasis:
 
     def test_the_original_is_not_mutated(self):
         """rebuild_menu reuses the aligned titles; emphasising in place would
-        leave every later row wearing the active row's accent."""
+        leave every later row wearing the active row's weight."""
         row = self._row()
         menubar._emphasise_active(AppKit, row)
-        bold, colour = self._attrs_at(row, 0)
+        bold, _ = self._attrs_at(row, 0)
         assert bold is False
-        assert colour != AppKit.NSColor.controlAccentColor()

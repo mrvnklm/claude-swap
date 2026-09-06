@@ -355,7 +355,6 @@ def format_account_label(
 
 MAXED_MARKER = "!"   # window at/over its limit — the usual reason to switch
 AHEAD_MARKER = "\u2191"   # weekly window running ahead of an even burn-down pace
-RESETS_CAPTION = "resets in"  # leads the dimmed second line of a detailed row
 SPEND_HEADER = "$"
 
 # Utilization thresholds behind the severity tint. Only the constrained end is
@@ -677,8 +676,9 @@ def _emphasise_active(AppKit, attributed):
     its reset countdowns, aligned with neither.
 
     Emphasis in the text has no such problem — it is part of the line it
-    describes. The accent colour is the system's, so it follows the user's
-    appearance settings and stays legible in both themes.
+    describes. Weight only, no colour: an accent-coloured row reads as a link
+    rather than as "you are here", and it competes with the warning and
+    critical colours that the percentages to its right depend on.
     """
     out = AppKit.NSMutableAttributedString.alloc().initWithAttributedString_(attributed)
     text = out.string()
@@ -702,11 +702,6 @@ def _emphasise_active(AppKit, attributed):
             existing, AppKit.NSBoldFontMask
         )
         out.addAttribute_value_range_(AppKit.NSFontAttributeName, bold, (0, head))
-    out.addAttribute_value_range_(
-        AppKit.NSForegroundColorAttributeName,
-        AppKit.NSColor.controlAccentColor(),
-        (0, head),
-    )
     return out
 
 
@@ -795,8 +790,6 @@ def build_attributed_rows(
             if with_resets:
                 widest = max(widest, width(row.resets[index], small_font))
         widths.append(widest)
-    if with_resets and len(widths) > 1:
-        widths[1] = max(widths[1], width(RESETS_CAPTION, small_font))
 
     # Give every window column the same width — an even rhythm reads far better
     # than columns that each hug their own widest value, and it keeps a "0%"
@@ -882,8 +875,12 @@ def build_attributed_rows(
                 AppKit.NSColor.secondaryLabelColor(),
                 (start, len(row.cells[3])))
         if with_resets and any(row.resets):
+            # No caption. It read "resets in" once per account — seven times
+            # down the menu, saying the same thing each time, and separated
+            # from its own values by whichever window columns were empty. The
+            # countdown sits directly under the percentage it belongs to, and
+            # the column header above already names the window.
             resets = list(row.resets)
-            resets[1] = RESETS_CAPTION
             attributed.appendAttributedString_(
                 AppKit.NSAttributedString.alloc().initWithString_attributes_(
                     "\n", {AppKit.NSParagraphStyleAttributeName: paragraph}))
