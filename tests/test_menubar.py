@@ -628,15 +628,9 @@ def test_table_model_columns_are_shared_and_deduplicated():
 
 
 def test_table_rows_carry_only_numbers():
-    # The leading cell is the active marker plus the slot number; every other
-    # cell is a bare measurement, because the window columns are right-aligned
-    # and prose dropped into one would run backwards across the row.
     rows = menubar.build_account_table(_TABLE_ACCOUNTS)
-    pad = menubar.INACTIVE_MARKER
-    assert rows[0].cells == (pad + "1", "a@x.de", "0%", "91%", "90%", "")
-    assert rows[1].cells == (
-        menubar.ACTIVE_MARKER + "2", "b@x.de", "19%", "3%", "0%", "58%"
-    )  # account 2 is the active one in this fixture
+    assert rows[0].cells == ("1", "a@x.de", "0%", "91%", "90%", "")
+    assert rows[1].cells == ("2", "b@x.de", "19%", "3%", "0%", "58%")
 
 
 def test_table_row_keeps_grid_width_when_a_window_is_missing():
@@ -1391,26 +1385,31 @@ class TestActiveRowEmphasis:
         ) if font is not None else False
         return bold, colour
 
-    def test_the_name_is_emphasised_by_weight_alone(self):
-        """No colour: an accent-coloured row reads as a link rather than as
-        "you are here", and it competes with the warning colours beside it."""
-        out = menubar._emphasise_active(AppKit, self._row())
-        bold, colour = self._attrs_at(out, 0)
-        assert bold is True
-        assert colour != AppKit.NSColor.controlAccentColor()
+    def test_the_whole_first_line_is_emphasised_by_weight_alone(self):
+        """Weight, not colour: an accent-coloured row reads as a link and
+        competes with the warning tints beside it. The whole line, not just the
+        name: stopping at the name left too little of the row to see."""
+        row = self._row()
+        text = row.string()
+        first_pct = text.find("\t", text.find("\t") + 1) + 1
+
+        out = menubar._emphasise_active(AppKit, row)
+
+        assert self._attrs_at(out, 0)[0] is True            # the slot number
+        assert self._attrs_at(out, first_pct)[0] is True    # and the numbers
+        assert self._attrs_at(out, 0)[1] != AppKit.NSColor.controlAccentColor()
 
     def test_a_warning_percentage_keeps_its_own_colour(self):
-        """The reading the operator most needs to see must not be repainted by
-        the emphasis. This is why the accent stops at the second tab."""
+        """Weight may run across the numbers; colour may not. The tints are
+        the reading the operator most needs to see."""
         row = self._row(active_pct=95.0)
         text = row.string()
         first_pct = text.find("\t", text.find("\t") + 1) + 1
 
         out = menubar._emphasise_active(AppKit, row)
-        bold, colour = self._attrs_at(out, first_pct)
+        _bold, colour = self._attrs_at(out, first_pct)
 
         assert colour == AppKit.NSColor.systemOrangeColor()
-        assert bold is False
 
     def test_the_original_is_not_mutated(self):
         """rebuild_menu reuses the aligned titles; emphasising in place would
@@ -1421,43 +1420,3 @@ class TestActiveRowEmphasis:
         assert bold is False
 
 
-class TestActiveMarker:
-    """Weight alone was not findable: at the menu font size a bold row in a
-    list of eight does not stand out, which is the one job the mark has."""
-
-    @staticmethod
-    def _accounts(active="6"):
-        lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
-        return [
-            (n, f"a{n}@example.com", n == active, lg, lg, "", False, None)
-            for n in ("1", "6", "9")
-        ]
-
-    def test_exactly_one_row_carries_the_marker(self):
-        rows = menubar.build_account_table(self._accounts())
-        marked = [r for r in rows if r.cells[0].startswith(menubar.ACTIVE_MARKER)]
-        assert len(marked) == 1
-        assert marked[0].cells[0] == menubar.ACTIVE_MARKER + "6"
-
-    def test_inactive_rows_are_padded_not_bare(self):
-        """A bare number on the inactive rows would shunt the active row
-        sideways and break the column the slot numbers live in."""
-        rows = menubar.build_account_table(self._accounts())
-        for row in rows:
-            assert len(row.cells[0]) == 2, row.cells[0]
-            assert row.cells[0][0] in (menubar.ACTIVE_MARKER, menubar.INACTIVE_MARKER)
-
-    def test_the_slot_number_survives_the_marker(self):
-        rows = menubar.build_account_table(self._accounts())
-        assert [r.cells[0][1:] for r in rows] == ["1", "6", "9"]
-
-    def test_the_focus_style_marks_it_too(self):
-        rows = menubar.build_focus_table(self._accounts())
-        marked = [r for r in rows if r.cells[0].startswith(menubar.ACTIVE_MARKER)]
-        assert len(marked) == 1
-
-    def test_a_sentinel_row_is_still_marked_when_active(self):
-        """An account that cannot report usage is still where you are."""
-        accounts = [("3", "a@b.c", True, "re-login needed", None, "", False, None)]
-        rows = menubar.build_account_table(accounts)
-        assert rows[0].cells[0].startswith(menubar.ACTIVE_MARKER)

@@ -372,15 +372,6 @@ class TableColumn:
     right_aligned: bool
 
 
-# Leads every account row. The active account gets the dot, everyone else an
-# EN SPACE of the same nominal width, so the slot numbers stay in one column
-# instead of the active row shunting itself sideways. A marker rather than
-# weight alone: at the menu font size a bold row is not findable at a glance
-# in a list of eight, which is the one job this has.
-ACTIVE_MARKER = "\u25cf"      # BLACK CIRCLE
-INACTIVE_MARKER = "\u2002"    # EN SPACE
-
-
 @dataclass(frozen=True)
 class TableRow:
     """One account's cells, the countdowns beneath them, and their severities."""
@@ -509,12 +500,11 @@ def build_account_table(accounts, now: float | None = None) -> list[TableRow]:
     width = len(columns)
     rows: list[TableRow] = []
 
-    for num, email, is_active, usage, _last_good, alias, disabled, fetched_at in accounts:
+    for num, email, _is_active, usage, _last_good, alias, disabled, fetched_at in accounts:
         name = f"{alias} ({email})" if alias else truncate_name(email)
         if disabled:
             name += "  (disabled)"
-        lead = (ACTIVE_MARKER if is_active else INACTIVE_MARKER) + str(num)
-        cells = [lead, name] + [""] * (width - 2)
+        cells = [str(num), name] + [""] * (width - 2)
         resets = [""] * width
         severities: list[str | None] = [None] * width
         values: list[float | None] = [None] * width
@@ -579,14 +569,13 @@ def build_focus_table(accounts, now: float | None = None) -> list[TableRow]:
     model_names = account_table_model_names(accounts, now)
     rows: list[TableRow] = []
 
-    for num, email, is_active, usage, _last_good, alias, disabled, fetched_at in accounts:
-        lead = (ACTIVE_MARKER if is_active else INACTIVE_MARKER) + str(num)
+    for num, email, _is_active, usage, _last_good, alias, disabled, fetched_at in accounts:
         name = f"{alias} ({email})" if alias else truncate_name(email)
         if disabled:
             name += "  (disabled)"
         if not isinstance(usage, dict):
             message = usage if isinstance(usage, str) else "usage unavailable"
-            rows.append(TableRow((lead, f"{name} — {message}", "", ""),
+            rows.append(TableRow((str(num), f"{name} — {message}", "", ""),
                                  ("", "", "", ""), (None,) * 4, (None,) * 4))
             continue
 
@@ -603,7 +592,7 @@ def build_focus_table(accounts, now: float | None = None) -> list[TableRow]:
                 windows.append((model, scoped[model]))
 
         if not windows:
-            rows.append(TableRow((lead, f"{name} — usage unavailable", "", ""),
+            rows.append(TableRow((str(num), f"{name} — usage unavailable", "", ""),
                                  ("", "", "", ""), (None,) * 4, (None,) * 4))
             continue
 
@@ -620,7 +609,7 @@ def build_focus_table(accounts, now: float | None = None) -> list[TableRow]:
             rest = f"{rest} · $ {spend['pct']:.0f}%" if rest else f"$ {spend['pct']:.0f}%"
         countdown = _live_countdown(window, now) or ""
         rows.append(TableRow(
-            (lead, name, binding, rest),
+            (str(num), name, binding, rest),
             ("", "", countdown, ""),
             (None, None, severity_for(window["pct"]), None),
             (None, None, float(window["pct"]), None),
@@ -693,16 +682,16 @@ def _emphasise_active(AppKit, attributed):
     """
     out = AppKit.NSMutableAttributedString.alloc().initWithAttributedString_(attributed)
     text = out.string()
-    # Only the slot number and the email — the cells before the second tab.
-    # NOT the whole line: the percentages carry their own warning and critical
-    # colours, and an accent laid over them would hide exactly the reading the
-    # operator most needs to see. Stopping at the name also keeps the emphasis
-    # off the quiet countdown line underneath.
-    first = text.find("\t")
-    head = text.find("\t", first + 1) if first >= 0 else -1
-    if head < 0:
-        newline = text.find("\n")
-        head = len(text) if newline < 0 else newline
+    # The whole first line, percentages included: weight is what makes the row
+    # findable, and stopping at the name left too little of it to see. Weight
+    # is also safe to run across the numbers in a way colour is not — it does
+    # not disturb the warning and critical tints they carry.
+    #
+    # The countdown line underneath is deliberately excluded: it is the quiet
+    # half of the row, and bolding it would make the active account shout
+    # twice while adding nothing to finding it.
+    newline = text.find("\n")
+    head = len(text) if newline < 0 else newline
     if head <= 0:
         return out
     existing = out.attribute_atIndex_effectiveRange_(
