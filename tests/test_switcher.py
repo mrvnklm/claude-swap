@@ -12363,3 +12363,76 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestStatusPayloadEngineHealth:
+    """`cswap status --json` is what a script polls, and it could not answer
+    "is the engine running?" at all."""
+
+    @staticmethod
+    def _switcher(temp_home, sample_sequence_data):
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    def test_absent_when_no_engine_was_asked_for(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """Additive: a consumer that never enabled one sees no new key."""
+        s = self._switcher(temp_home, sample_sequence_data)
+        assert "autoSwitch" not in s._build_status_payload()
+
+    def test_present_and_unhealthy_when_the_engine_is_stale(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap import heartbeat
+        from claude_swap.settings import set_setting
+
+        s = self._switcher(temp_home, sample_sequence_data)
+        set_setting(s.backup_dir, "autoswitch.background", "true")
+        heartbeat.write_beat(
+            s.backup_dir, now=time.time() - 36 * 3600, next_delay=60.0,
+            outcome="no-action",
+        )
+
+        health = s._build_status_payload()["autoSwitch"]
+
+        assert health["enabled"] is True
+        assert health["healthy"] is False
+        assert "note" in health
+        assert health["lastOutcome"] == "no-action"
+
+    def test_present_and_healthy_when_the_engine_is_ticking(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap import heartbeat
+        from claude_swap.settings import set_setting
+
+        s = self._switcher(temp_home, sample_sequence_data)
+        set_setting(s.backup_dir, "autoswitch.background", "true")
+        heartbeat.write_beat(
+            s.backup_dir, now=time.time(), next_delay=60.0, outcome="switched"
+        )
+
+        health = s._build_status_payload()["autoSwitch"]
+
+        assert health["healthy"] is True
+        assert "note" not in health
+        assert health["lastTickAgoSeconds"] < 5
+
+    def test_it_survives_having_no_active_account(
+        self, temp_home, sample_sequence_data
+    ):
+        """The early return where "is the engine running?" matters MOST — a
+        machine with nothing active — was the one path that could omit it."""
+        from claude_swap.settings import set_setting
+
+        s = self._switcher(temp_home, sample_sequence_data)
+        set_setting(s.backup_dir, "autoswitch.background", "true")
+
+        with patch.object(s, "_get_current_account", return_value=None):
+            payload = s._build_status_payload()
+
+        assert payload["active"] is None
+        assert payload["autoSwitch"]["enabled"] is True

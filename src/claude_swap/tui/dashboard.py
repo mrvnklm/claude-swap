@@ -43,6 +43,28 @@ MenuEntries = list[tuple[str, str]]  # (label, action_id)
 _BACK = ("← back", "back")
 
 
+def liveness_text(backup_dir) -> str | None:
+    """Engine liveness, computed fresh, or None when there is nothing to say.
+
+    One definition for every screen that shows it. Computed on each call rather
+    than cached: these surfaces redraw on their own schedule, and a cached age
+    would be frozen at whatever it was when the screen was built — which is
+    exactly the kind of stale reading this whole mechanism exists to catch.
+    """
+    from claude_swap import heartbeat
+    from claude_swap.settings import load_settings
+
+    try:
+        return heartbeat.describe(
+            backup_dir,
+            expected=load_settings(backup_dir).background,
+            now=time.time(),
+        )
+    except Exception:
+        _logger.warning("could not read engine heartbeat", exc_info=True)
+        return None
+
+
 class DashboardScreen(Screen):
     BINDINGS = [
         Binding("s", "open_switch", "Switch accounts"),
@@ -65,13 +87,29 @@ class DashboardScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(id="accounts-panel")
+        # Hidden unless there is something wrong. This is the screen you land
+        # on, and it was the one that said nothing at all while an engine had
+        # been dead for a day and a half.
+        yield Static("", id="engine-note")
         yield Static("", id="menu-title")
         yield ListView(id="menu")
         yield Footer()
 
     async def on_mount(self) -> None:
         self.query_one("#menu", ListView).focus()
+        self._refresh_engine_note()
+        self.watch(self.app, "refresh_status", self._on_refresh_status)
         await self._push_menu("menu", self._root_entries())
+
+    def _on_refresh_status(self, _status: str) -> None:
+        self._refresh_engine_note()
+
+    def _refresh_engine_note(self) -> None:
+        note = liveness_text(self.app.switcher.backup_dir)
+        widget = self.query_one("#engine-note", Static)
+        widget.display = note is not None
+        if note is not None:
+            widget.update(note)
 
     # -- menu plumbing --------------------------------------------------------
 
@@ -426,27 +464,11 @@ class WatchScreen(AccountListScreen):
         # list and fresh usage, throughout a 36-hour outage in which nothing
         # was deciding anything. An order says what WOULD happen next; it does
         # not say that anyone is going to do it.
-        alarm = self._liveness_text()
+        alarm = liveness_text(self.app.switcher.backup_dir)
         if alarm:
             return f"{self._WATCH_TITLE} · {alarm}"
         status = self.app.refresh_status
         return f"{self._WATCH_TITLE} · {status}" if status else self._WATCH_TITLE
-
-    def _liveness_text(self) -> str | None:
-        """Engine liveness, computed fresh — the title redraws on its own."""
-        from claude_swap import heartbeat
-        from claude_swap.settings import load_settings
-
-        try:
-            backup_dir = self.app.switcher.backup_dir
-            return heartbeat.describe(
-                backup_dir,
-                expected=load_settings(backup_dir).background,
-                now=time.time(),
-            )
-        except Exception:
-            _logger.warning("could not read engine heartbeat", exc_info=True)
-            return None
 
     def _on_refresh_status(self, status: str) -> None:
         if not self._selecting:

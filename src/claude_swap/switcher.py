@@ -303,6 +303,18 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 
 
 
+def _with_health(payload: dict, health: dict | None) -> dict:
+    """Attach engine liveness to a status payload, or leave it untouched.
+
+    Every early return of ``_build_status_payload`` goes through here, so a
+    machine that has no active account — arguably the state where "is the
+    engine running?" matters most — cannot be the one path that omits it.
+    """
+    if health is not None:
+        payload["autoSwitch"] = health
+    return payload
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -5624,26 +5636,58 @@ class ClaudeAccountSwitcher:
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
+    def _auto_switch_health(self) -> dict | None:
+        """Engine liveness for the machine-readable surfaces, or None.
+
+        Additive: absent entirely when no background engine was asked for, so
+        a consumer that never enabled one sees no new key and nothing to
+        interpret. Present the moment `autoswitch.background` is on, because
+        that is the point at which "is it running?" becomes a question with a
+        wrong answer.
+        """
+        try:
+            from claude_swap import heartbeat
+            from claude_swap.settings import load_settings
+
+            if not load_settings(self.backup_dir).background:
+                return None
+            now = time.time()
+            beat = heartbeat.read_beat(self.backup_dir)
+            note = heartbeat.describe(self.backup_dir, expected=True, now=now)
+            out: dict = {"enabled": True, "healthy": note is None}
+            if note is not None:
+                out["note"] = note
+            if beat is not None:
+                out["lastTickAt"] = beat.tick_at
+                out["lastTickAgoSeconds"] = round(beat.age_s(now), 1)
+                out["lastOutcome"] = beat.outcome
+                out["host"] = beat.host
+            return out
+        except Exception:
+            self._logger.debug("Failed to build auto-switch health", exc_info=True)
+            return None
+
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
+        health = self._auto_switch_health()
         identity = self._get_current_account()
         if identity is None:
-            return {"schemaVersion": SCHEMA_VERSION, "active": None}
+            return _with_health({"schemaVersion": SCHEMA_VERSION, "active": None}, health)
         current_email, current_org_uuid = identity
 
         data = self._get_sequence_data_migrated()
         if not data:
-            return {
+            return _with_health({
                 "schemaVersion": SCHEMA_VERSION,
                 "active": {"email": current_email, "managed": False},
-            }
+            }, health)
 
         account_num = self._find_account_slot(data, current_email, current_org_uuid)
         if not account_num:
-            return {
+            return _with_health({
                 "schemaVersion": SCHEMA_VERSION,
                 "active": {"email": current_email, "managed": False},
-            }
+            }, health)
 
         acct = data["accounts"][account_num]
         org_name = acct.get("organizationName", "") or ""
@@ -5673,11 +5717,11 @@ class ClaudeAccountSwitcher:
                     entry.last_good, entry.fetched_at, entry.age_s
                 )
             )
-        return {
+        return _with_health({
             "schemaVersion": SCHEMA_VERSION,
             "active": active,
             "totalManagedAccounts": len(data.get("accounts", {})),
-        }
+        }, health)
 
     def status(self, json_output: bool = False) -> dict | None:
         """Display current account status (or return the schema-v1 payload)."""

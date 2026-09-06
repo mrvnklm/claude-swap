@@ -1099,6 +1099,57 @@ class TestDashboard:
 
 
 @pytest.mark.asyncio
+class TestDashboardEngineNote:
+    """The screen you land on said nothing at all while an engine had been
+    dead for a day and a half, and every account row it drew was fresh —
+    because any surface refreshes the shared usage store."""
+
+    async def test_a_dead_engine_is_reported_on_the_landing_screen(
+        self, tmp_path
+    ):
+        from claude_swap import heartbeat
+        from claude_swap.settings import set_setting
+
+        set_setting(tmp_path, "autoswitch.background", "true")
+        heartbeat.write_beat(
+            tmp_path, now=time.time() - 36 * 3600, next_delay=60.0, outcome="no-action"
+        )
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            from textual.widgets import Static
+
+            note = app.screen.query_one("#engine-note", Static)
+            assert note.display is True
+            assert "auto-switch is enabled" in note.render().plain
+
+    async def test_it_is_hidden_when_no_engine_was_asked_for(self, tmp_path):
+        """The shipped default runs no engine; an empty row would be noise."""
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            from textual.widgets import Static
+
+            assert app.screen.query_one("#engine-note", Static).display is False
+
+    async def test_it_is_hidden_when_the_engine_is_healthy(self, tmp_path):
+        from claude_swap import heartbeat
+        from claude_swap.settings import set_setting
+
+        set_setting(tmp_path, "autoswitch.background", "true")
+        heartbeat.write_beat(tmp_path, now=time.time(), next_delay=60.0, outcome=None)
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            from textual.widgets import Static
+
+            assert app.screen.query_one("#engine-note", Static).display is False
+
+
+@pytest.mark.asyncio
 class TestWatchScreen:
     def _fake(self, tmp_path):
         return FakeSwitcher(
