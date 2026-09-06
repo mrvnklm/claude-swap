@@ -668,6 +668,48 @@ def _bar_attachment(AppKit, image):
     return AppKit.NSAttributedString.attributedStringWithAttachment_(attachment)
 
 
+def _emphasise_active(AppKit, attributed):
+    """Mark the active account inside the row rather than beside it.
+
+    ``NSMenuItem.state`` draws a checkmark centred vertically over the whole
+    item. That is right for a one-line item and wrong for a grid row, which is
+    two lines tall: the mark ends up floating in the gap between the name and
+    its reset countdowns, aligned with neither.
+
+    Emphasis in the text has no such problem — it is part of the line it
+    describes. The accent colour is the system's, so it follows the user's
+    appearance settings and stays legible in both themes.
+    """
+    out = AppKit.NSMutableAttributedString.alloc().initWithAttributedString_(attributed)
+    text = out.string()
+    # Only the slot number and the email — the cells before the second tab.
+    # NOT the whole line: the percentages carry their own warning and critical
+    # colours, and an accent laid over them would hide exactly the reading the
+    # operator most needs to see. Stopping at the name also keeps the emphasis
+    # off the quiet countdown line underneath.
+    first = text.find("\t")
+    head = text.find("\t", first + 1) if first >= 0 else -1
+    if head < 0:
+        newline = text.find("\n")
+        head = len(text) if newline < 0 else newline
+    if head <= 0:
+        return out
+    existing = out.attribute_atIndex_effectiveRange_(
+        AppKit.NSFontAttributeName, 0, None
+    )[0]
+    if existing is not None:
+        bold = AppKit.NSFontManager.sharedFontManager().convertFont_toHaveTrait_(
+            existing, AppKit.NSBoldFontMask
+        )
+        out.addAttribute_value_range_(AppKit.NSFontAttributeName, bold, (0, head))
+    out.addAttribute_value_range_(
+        AppKit.NSForegroundColorAttributeName,
+        AppKit.NSColor.controlAccentColor(),
+        (0, head),
+    )
+    return out
+
+
 def build_attributed_rows(
     AppKit,
     rows: list[TableRow],
@@ -1352,8 +1394,17 @@ def run(switcher) -> int:
                 # The plain label above stays the item's rumps key (unique per
                 # account); the attributed title only changes what's drawn.
                 if aligned is not None:
-                    item._menuitem.setAttributedTitle_(aligned[index])
-                item.state = 1 if is_active else 0
+                    title = aligned[index]
+                    if is_active:
+                        title = _emphasise_active(AppKit, title)
+                    item._menuitem.setAttributedTitle_(title)
+                    # NOT item.state: AppKit centres the state image vertically
+                    # over the WHOLE item, and a grid row is two lines tall, so
+                    # the checkmark floats in the gap between them instead of
+                    # sitting on the name. The emphasis above marks the active
+                    # row inside the text, where it lines up by construction.
+                else:
+                    item.state = 1 if is_active else 0
                 account_items.append(item)
             if not accounts:
                 account_items = [rumps.MenuItem("No managed accounts", callback=None)]

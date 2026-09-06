@@ -1342,3 +1342,73 @@ def test_the_toggle_writes_the_shared_setting(tmp_path, monkeypatch):
 
     assert load_settings(tmp_path).background is True
     assert app._auto_on is True
+
+
+@needs_appkit
+class TestActiveRowEmphasis:
+    """NSMenuItem.state centres its checkmark vertically over the WHOLE item,
+    and a grid row is two lines tall — so the mark floated in the gap between
+    the name and its countdowns, aligned with neither. The active row is marked
+    inside the text instead."""
+
+    @staticmethod
+    def _row(active_pct=95.0):
+        rows = [
+            menubar.TableRow(
+                cells=("8", "a@b.c", f"{active_pct:.0f}%", "10%"),
+                values=(None, None, active_pct, 10.0),
+                severities=(None, None, "warning", None),
+                resets=("", "resets in", "1h", "2d"),
+            ),
+        ]
+        columns = (
+            menubar.TableColumn("num", "", False),
+            menubar.TableColumn("name", "", False),
+            menubar.TableColumn("window", "5h", True),
+            menubar.TableColumn("window", "7d", True),
+        )
+        titles, _ = menubar.build_attributed_rows(
+            AppKit, rows, columns, ("", "", "5h", "7d"), with_resets=True
+        )
+        return titles[0]
+
+    def _attrs_at(self, attributed, index):
+        font = attributed.attribute_atIndex_effectiveRange_(
+            AppKit.NSFontAttributeName, index, None
+        )[0]
+        colour = attributed.attribute_atIndex_effectiveRange_(
+            AppKit.NSForegroundColorAttributeName, index, None
+        )[0]
+        bold = bool(
+            AppKit.NSFontManager.sharedFontManager().traitsOfFont_(font)
+            & AppKit.NSBoldFontMask
+        ) if font is not None else False
+        return bold, colour
+
+    def test_the_name_is_emphasised(self):
+        out = menubar._emphasise_active(AppKit, self._row())
+        bold, colour = self._attrs_at(out, 0)
+        assert bold is True
+        assert colour == AppKit.NSColor.controlAccentColor()
+
+    def test_a_warning_percentage_keeps_its_own_colour(self):
+        """The reading the operator most needs to see must not be repainted by
+        the emphasis. This is why the accent stops at the second tab."""
+        row = self._row(active_pct=95.0)
+        text = row.string()
+        first_pct = text.find("\t", text.find("\t") + 1) + 1
+
+        out = menubar._emphasise_active(AppKit, row)
+        bold, colour = self._attrs_at(out, first_pct)
+
+        assert colour == AppKit.NSColor.systemOrangeColor()
+        assert bold is False
+
+    def test_the_original_is_not_mutated(self):
+        """rebuild_menu reuses the aligned titles; emphasising in place would
+        leave every later row wearing the active row's accent."""
+        row = self._row()
+        menubar._emphasise_active(AppKit, row)
+        bold, colour = self._attrs_at(row, 0)
+        assert bold is False
+        assert colour != AppKit.NSColor.controlAccentColor()
