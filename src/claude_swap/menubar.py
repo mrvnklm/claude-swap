@@ -37,6 +37,12 @@ _logger = logging.getLogger("claude-swap")
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
+# The two windows want opposite values, so they get opposite ranges. Quota not
+# spent before a WEEKLY reset is gone for good, so that window is drained hard;
+# overshooting the 5h window costs one interrupted turn and it recycles in
+# hours, so it keeps a margin.
+FIVE_HOUR_CHOICES: tuple[int, ...] = (80, 85, 90, 95)
+WEEKLY_CHOICES: tuple[int, ...] = (90, 95, 98, 99)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 # How each account row is laid out. "compact" is the original free-text line;
 # the rest share one column grid across all accounts (see build_account_table),
@@ -1338,12 +1344,25 @@ def run(switcher) -> int:
                     # menu-bar user with a silently inert filter.
                     rumps.notification("claude-swap", "Configuration warning", ev.human())
 
-        def _threshold(self) -> int:
-            """Current auto-switch threshold from core settings (for the menu)."""
+        def _thresholds(self) -> tuple[float, float]:
+            """The lines the engine actually fires on, per window.
+
+            Not ``autoswitch.threshold``: once either per-window key is set,
+            the base is only a fallback, and showing it would name a number
+            nothing switches at. Read through the engine's own
+            ``window_threshold`` so the menu cannot disagree with the decision.
+            """
+            from claude_swap.autoswitch import window_threshold
+
             try:
-                return int(load_settings(self.switcher.backup_dir).threshold)
+                settings = load_settings(self.switcher.backup_dir)
+                return (
+                    window_threshold("5h", settings),
+                    window_threshold("7d", settings),
+                )
             except Exception:
-                return 0
+                _logger.warning("could not read the switch thresholds", exc_info=True)
+                return (0.0, 0.0)
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
@@ -1559,12 +1578,30 @@ def run(switcher) -> int:
             auto_item.state = 1 if self._auto_on else 0
             menu.add(auto_item)
 
-            threshold_menu = rumps.MenuItem("Auto-switch threshold")
-            current = self._threshold()
-            for pct in AUTO_THRESHOLD_CHOICES:
-                ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
-                ch.state = 1 if current == pct else 0
-                threshold_menu.add(ch)
+            # Named per window, and the effective numbers in the parent title.
+            # One unlabelled "Auto-switch threshold" could not say WHICH line
+            # it set, and once the per-window keys exist it was not even the
+            # line the engine fires on.
+            five, weekly = self._thresholds()
+            threshold_menu = rumps.MenuItem(
+                f"Auto-switch at    5h {five:.0f}%  ·  weekly {weekly:.0f}%"
+            )
+            five_menu = rumps.MenuItem("5h window")
+            for pct in FIVE_HOUR_CHOICES:
+                ch = rumps.MenuItem(
+                    f"{pct}%", callback=self._make_window_threshold("thresholdFiveHour", pct)
+                )
+                ch.state = 1 if int(five) == pct else 0
+                five_menu.add(ch)
+            threshold_menu.add(five_menu)
+            weekly_menu = rumps.MenuItem("Weekly windows")
+            for pct in WEEKLY_CHOICES:
+                ch = rumps.MenuItem(
+                    f"{pct}%", callback=self._make_window_threshold("thresholdWeekly", pct)
+                )
+                ch.state = 1 if int(weekly) == pct else 0
+                weekly_menu.add(ch)
+            threshold_menu.add(weekly_menu)
             menu.add(threshold_menu)
 
             return menu
@@ -1753,13 +1790,14 @@ def run(switcher) -> int:
                 self._stop_engine()
             self.rebuild_menu()
 
-        def _make_threshold(self, pct):
+        def _make_window_threshold(self, key, pct):
             def cb(_sender):
                 try:
-                    set_setting(self.switcher.backup_dir, "autoswitch.threshold", str(pct))
+                    set_setting(self.switcher.backup_dir, f"autoswitch.{key}", str(pct))
                 except Exception as e:
                     rumps.alert(title="claude-swap", message=f"Couldn't set threshold: {e}")
                     return
+                self._settings_mtime = self._settings_stat()  # our own write
                 self._restart_engine()  # apply immediately if running
                 self.rebuild_menu()
             return cb

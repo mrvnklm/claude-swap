@@ -1420,3 +1420,42 @@ class TestActiveRowEmphasis:
         assert bold is False
 
 
+
+
+class TestPerWindowThresholdMenu:
+    """One unlabelled "Auto-switch threshold" could not say WHICH line it set,
+    and once the per-window keys exist it was not even the line the engine
+    fires on — a machine reading 98% in the menu was switching at 90 and 95."""
+
+    def test_the_menu_choices_cover_each_window_s_own_range(self):
+        """The two windows want opposite values, so they get opposite ranges."""
+        assert max(menubar.WEEKLY_CHOICES) > max(menubar.FIVE_HOUR_CHOICES)
+        assert min(menubar.FIVE_HOUR_CHOICES) < min(menubar.WEEKLY_CHOICES)
+
+    def test_the_displayed_lines_are_the_ones_the_engine_uses(self, tmp_path):
+        """Read through the engine's own window_threshold, so the menu cannot
+        name a number nothing switches at."""
+        from claude_swap.autoswitch import window_threshold
+        from claude_swap.settings import load_settings, set_setting
+
+        set_setting(tmp_path, "autoswitch.threshold", "98")
+        set_setting(tmp_path, "autoswitch.thresholdFiveHour", "90")
+        set_setting(tmp_path, "autoswitch.thresholdWeekly", "95")
+        settings = load_settings(tmp_path)
+
+        assert window_threshold("5h", settings) == 90.0
+        assert window_threshold("7d", settings) == 95.0
+        assert settings.threshold == 98.0, (
+            "the base is still 98 — which is exactly the number the old menu "
+            "would have shown and ticked"
+        )
+
+    def test_an_unset_window_key_shows_the_base_it_falls_back_to(self, tmp_path):
+        from claude_swap.autoswitch import window_threshold
+        from claude_swap.settings import load_settings, set_setting
+
+        set_setting(tmp_path, "autoswitch.threshold", "85")
+        settings = load_settings(tmp_path)
+
+        assert window_threshold("5h", settings) == 85.0
+        assert window_threshold("7d", settings) == 85.0
