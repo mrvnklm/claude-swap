@@ -1428,9 +1428,12 @@ class TestPerWindowThresholdMenu:
     fires on — a machine reading 98% in the menu was switching at 90 and 95."""
 
     def test_the_menu_choices_cover_each_window_s_own_range(self):
-        """The two windows want opposite values, so they get opposite ranges."""
-        assert max(menubar.WEEKLY_CHOICES) > max(menubar.FIVE_HOUR_CHOICES)
+        """The 5h range starts lower because an overshoot there is cheap, but
+        both reach into the aggressive end — how much margin the 5h window is
+        worth is the operator's call, not this list's."""
         assert min(menubar.FIVE_HOUR_CHOICES) < min(menubar.WEEKLY_CHOICES)
+        assert 98 in menubar.FIVE_HOUR_CHOICES
+        assert 98 in menubar.WEEKLY_CHOICES
 
     def test_the_displayed_lines_are_the_ones_the_engine_uses(self, tmp_path):
         """Read through the engine's own window_threshold, so the menu cannot

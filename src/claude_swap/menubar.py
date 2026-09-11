@@ -37,11 +37,12 @@ _logger = logging.getLogger("claude-swap")
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
-# The two windows want opposite values, so they get opposite ranges. Quota not
-# spent before a WEEKLY reset is gone for good, so that window is drained hard;
-# overshooting the 5h window costs one interrupted turn and it recycles in
-# hours, so it keeps a margin.
-FIVE_HOUR_CHOICES: tuple[int, ...] = (80, 85, 90, 95)
+# The two windows want different values, so they get different ranges. Quota
+# not spent before a WEEKLY reset is gone for good, so that window is drained
+# hardest. Overshooting the 5h window costs one interrupted turn and it
+# recycles in hours, so its range starts lower — but it reaches 98 too, because
+# how much margin that is worth is the operator's call, not this list's.
+FIVE_HOUR_CHOICES: tuple[int, ...] = (80, 85, 90, 95, 98)
 WEEKLY_CHOICES: tuple[int, ...] = (90, 95, 98, 99)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 # How each account row is laid out. "compact" is the original free-text line;
