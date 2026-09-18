@@ -424,6 +424,13 @@ class TestParseModelNames:
         assert parse_model_names("") == (MODEL_SCOPE_ALL,)
         assert parse_model_names("off") == ()
         assert parse_model_names("none") == ()
+        # Surrounding whitespace must not turn the opt-out into a model
+        # literally named "off". `cswap config set` trims, so this only
+        # arrives via a hand-edited settings.json -- which `_clamped` keeps
+        # verbatim, making the trim in the off-check the only thing standing
+        # between " off " and a gate that reports models=["off"].
+        assert parse_model_names(" off ") == ()
+        assert parse_model_names("\tNone\n") == ()
 
     def test_the_trim_survives_the_round_trip_into_relevant_windows(self):
         # The reason the trim matters at all: the parsed names are matched
