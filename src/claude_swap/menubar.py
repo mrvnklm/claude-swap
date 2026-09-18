@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.paths import get_backup_root
 from claude_swap.printer import warning
@@ -214,33 +214,14 @@ def _live_countdown(window: dict | str | None, now: float) -> str | None:
     return f"{minutes}m"
 
 
-_WEEKLY_PERIOD_S = 7 * 86400  # weekly limits reset on a fixed 7-day cadence
+_WEEKLY_PERIOD_S = oauth.WEEKLY_PERIOD_S
 
-
-def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
-    """A weekly window with a passed reset advanced to its next 7-day boundary.
-
-    Weekly limits reset on a fixed weekly cadence, so once the stored
-    ``resets_at`` is in the past we know the window rolled over — the stored pct
-    belongs to a window that no longer exists. Return a copy reflecting the reset
-    state (``pct`` 0, ``resets_at`` advanced to the next future boundary) so the
-    menu bar shows the reset from the static schedule alone, without waiting to
-    spend tokens on a fresh fetch. Missing/future/unparseable windows are
-    returned unchanged.
-    """
-    if not isinstance(window, dict):
-        return window
-    ts = _resets_at_ts(window)
-    if ts == float("inf") or ts > now:
-        return window
-    missed = int((now - ts) // _WEEKLY_PERIOD_S) + 1
-    new_ts = ts + missed * _WEEKLY_PERIOD_S
-    rolled = dict(window)
-    rolled["pct"] = 0.0
-    rolled["resets_at"] = datetime.fromtimestamp(new_ts, tz=timezone.utc).isoformat()
-    rolled.pop("countdown", None)  # recomputed live from the rolled resets_at
-    rolled.pop("clock", None)
-    return rolled
+# The roll-forward rule lives with the windows themselves (`oauth`), not here:
+# the menu bar and the decision path must give the SAME answer for the same
+# data, and a second copy of the rule is exactly how they drifted apart before
+# (display 0%, engine 98% off a 17-day-old scoped measurement). Kept as a local
+# name because the module's renderers read better with the leading underscore.
+_rolled_weekly_window = oauth.rolled_weekly_window
 
 
 def usage_summary(

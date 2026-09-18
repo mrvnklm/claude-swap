@@ -472,7 +472,9 @@ def due_candidate(
     return due[0][2]
 
 
-def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> float | None:
+def _earliest_reset(
+    last_good: dict | None, models: tuple[str, ...] = (), now: float | None = None
+) -> float | None:
     """Epoch of the soonest relevant window to roll over, or None if unknown.
 
     The soonest one is what matters: once it resets, usage there is zeroed and
@@ -483,7 +485,7 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
     """
     resets = [
         ts
-        for _, _, resets_at in oauth.relevant_windows(last_good, models)
+        for _, _, resets_at in oauth.relevant_windows(last_good, models, now)
         if (ts := parse_reset_ts(resets_at)) is not None
     ]
     return min(resets) if resets else None
@@ -523,7 +525,7 @@ def _rate_limited_trust_ok(
     if age_s is None:
         return False
     ceiling = now + (RATE_LIMIT_TRUST_MAX_AGE_S - age_s)
-    soonest = _earliest_reset(last_good, models)
+    soonest = _earliest_reset(last_good, models, now)
     # The soonest window to roll over invalidates the snapshot; never trust past
     # it, and never past the client-side ceiling.
     return now < (min(soonest, ceiling) if soonest is not None else ceiling)

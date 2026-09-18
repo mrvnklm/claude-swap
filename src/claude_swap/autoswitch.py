@@ -565,7 +565,7 @@ _refresh_fingerprint = oauth.credential_fingerprint
 
 
 def _window_pcts(
-    usage: dict | None, models: tuple[str, ...] = ()
+    usage: dict | None, models: tuple[str, ...] = (), now: float | None = None
 ) -> dict[str, float]:
     """Ordered window label → pct: "5h", "7d", then configured scoped names.
 
@@ -576,7 +576,7 @@ def _window_pcts(
     per-model usage lives in ``cswap list``.
     """
     return {
-        name: pct for name, pct, _ in oauth.relevant_windows(usage, models)
+        name: pct for name, pct, _ in oauth.relevant_windows(usage, models, now)
     }
 
 
@@ -635,7 +635,7 @@ def _binding_recovery_ts(
     # at 40% resetting in an hour returned "back in an hour", which is the
     # opposite of what binds. An account whose binding window has no usable
     # reset is one we cannot schedule around, and inf sorts it last.
-    windows = list(oauth.relevant_windows(usage, models))
+    windows = list(oauth.relevant_windows(usage, models, now))
     if not windows:
         return float("inf")
     _label, _pct, resets_at = max(windows, key=lambda w: w[1])
@@ -744,7 +744,9 @@ def preference_order(
     known: list[tuple[tuple, str]] = []
     unknown: list[str] = []
     for num, value in usage.items():
-        headroom = oauth.account_headroom(value if isinstance(value, dict) else None, models)
+        headroom = oauth.account_headroom(
+            value if isinstance(value, dict) else None, models, now
+        )
         if headroom is None:
             unknown.append(num)
             continue
@@ -790,6 +792,7 @@ def pressure(
     usage: dict | str | None,
     models: tuple[str, ...],
     settings: AutoSwitchSettings,
+    now: float | None = None,
 ) -> float | None:
     """How close this account is to the first line it will cross, as a ratio.
 
@@ -802,8 +805,16 @@ def pressure(
     window has crossed anything, yet ``max(pct) = 94`` clears the 5h line of 90
     and would fire. Dividing each window by its own line keeps the comparison
     honest, and collapses to the old behaviour exactly when the lines are equal.
+
+    ``now`` is the tick's clock, forwarded to ``oauth.relevant_windows`` so a
+    weekly window that has already rolled reads as 0 here too. Without it this
+    function would fall back to wall time while the rest of the tick uses the
+    engine's clock, and the per-window lines would be measured against a
+    different set of windows than the headroom they are compared with.
     """
-    windows = oauth.relevant_windows(usage if isinstance(usage, dict) else None, models)
+    windows = oauth.relevant_windows(
+        usage if isinstance(usage, dict) else None, models, now
+    )
     ratios = [
         pct / window_threshold(label, settings)
         for label, pct, _ in windows
@@ -817,12 +828,20 @@ def _ref(number: str, email: str) -> dict:
 
 
 def _headroom_by_account(
-    usage: dict[str, dict | str | None], models: tuple[str, ...]
+    usage: dict[str, dict | str | None],
+    models: tuple[str, ...],
+    now: float | None = None,
 ) -> dict[str, float | None]:
-    """Per-account headroom derived from decision values."""
+    """Per-account headroom derived from decision values.
+
+    ``now`` is the tick's clock: weekly windows roll over against it (see
+    ``oauth.relevant_windows``), so passing the engine's own clock rather than
+    falling back to wall time keeps headroom and the sleep scheduler — which
+    reads ``self.clock()`` — talking about the same instant.
+    """
     return {
         num: oauth.account_headroom(
-            value if isinstance(value, dict) else None, models
+            value if isinstance(value, dict) else None, models, now
         )
         for num, value in usage.items()
     }
@@ -1162,7 +1181,7 @@ class AutoSwitchEngine:
             "email": "",
         }
 
-        entries, usage, headroom = self._collect_scheduled_usage(
+        entries, usage, headroom, collected_now = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold,
             may_fetch=may_fetch,
         )
@@ -1180,7 +1199,9 @@ class AutoSwitchEngine:
                     num: pcts
                     for num, value in usage.items()
                     if (pcts := _window_pcts(
-                        value if isinstance(value, dict) else None, self._models
+                        value if isinstance(value, dict) else None,
+                        self._models,
+                        collected_now,
                     ))
                 },
             )
@@ -1210,7 +1231,9 @@ class AutoSwitchEngine:
             # threshold and the closest one decides. Falls back to the single
             # `threshold` for both when neither override is set, so an existing
             # configuration triggers exactly where it did before.
-            active_pressure = pressure(usage.get(current), self._models, settings)
+            active_pressure = pressure(
+                usage.get(current), self._models, settings, collected_now
+            )
             if active_pressure is None:
                 active_pressure = utilization / settings.threshold if settings.threshold else 0.0
             if active_pressure < 1.0:
@@ -1506,9 +1529,9 @@ class AutoSwitchEngine:
                 fetch={current, *candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
-            headroom = _headroom_by_account(usage, self._models)
-            active_headroom = headroom.get(current)
             decided_now = self.clock()
+            headroom = _headroom_by_account(usage, self._models, decided_now)
+            active_headroom = headroom.get(current)
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
@@ -2105,10 +2128,12 @@ class AutoSwitchEngine:
             active_headroom,
             settings.threshold,
             pressures={
-                n: pressure(usage.get(n), self._models, settings)
+                n: pressure(usage.get(n), self._models, settings, now)
                 for n in oauth_candidates
             },
-            active_pressure=pressure(usage.get(current), self._models, settings),
+            active_pressure=pressure(
+                usage.get(current), self._models, settings, now
+            ),
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -2167,7 +2192,7 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                cand_pressure = pressure(usage.get(num), self._models, settings)
+                cand_pressure = pressure(usage.get(num), self._models, settings, now)
                 if cand_pressure is None:
                     cand_pressure = (
                         (100.0 - h) / settings.threshold if settings.threshold else 0.0
@@ -2291,7 +2316,9 @@ class AutoSwitchEngine:
         *,
         threshold: float | None = None,
         may_fetch: bool = True,
-    ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
+    ) -> tuple[
+        dict, dict[str, dict | str | None], dict[str, float | None], float
+    ]:
         """Two-phase usage collection with an O(1) baseline.
 
         Phase A fetches the active account (when its persisted poll plan says
@@ -2331,8 +2358,12 @@ class AutoSwitchEngine:
         tick quantisation). Gating on the tick's own permission is what keeps
         "a tick without fresh data triggers no fetch" true by construction.
 
-        Returns ``(entries, usage, headroom)`` where ``usage`` carries
+        Returns ``(entries, usage, headroom, now)`` where ``usage`` carries
         decision values and ``headroom`` the derived headroom per account.
+        ``now`` is the single clock read this collection ran on: weekly windows
+        roll over against it, so every surface derived from this snapshot (the
+        PollEvent's window pcts included) must reuse it rather than take a
+        second reading that could straddle a reset boundary.
         """
         now = self.clock()
         # Quarantined accounts can never be switch targets, so spending the
@@ -2346,7 +2377,10 @@ class AutoSwitchEngine:
         pre = self.switcher.usage_entries_by_account(fetch=set())
         if not may_fetch:
             usage = {num: entry.decision_value() for num, entry in pre.items()}
-            return pre, usage, _headroom_by_account(usage, self._models)
+            # ``now`` rides out here too: a decision tick rolls weekly windows
+            # against the same instant a polling tick would, so the two
+            # cadences can never disagree about whether a window has reset.
+            return pre, usage, _headroom_by_account(usage, self._models, now), now
         plan: set[str] = set()
         active_pre = pre.get(current)
         # The active account is nominated when never fetched, poll-due per its
@@ -2363,7 +2397,7 @@ class AutoSwitchEngine:
             and active_pre.age_s >= poll_policy.ACTIVE_MAX_INTERVAL_S
             and (active_pre.poll_interval_s or 0.0)
             > poll_policy.ACTIVE_MAX_INTERVAL_S
-            and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
+            and (binding_pct(active_pre.last_good, self._models, now) or 0.0) < 100.0
         )
         overslept_plan = (
             active_pre is not None
@@ -2399,7 +2433,9 @@ class AutoSwitchEngine:
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
-            active_value if isinstance(active_value, dict) else None, self._models
+            active_value if isinstance(active_value, dict) else None,
+            self._models,
+            now,
         )
         # The caller's tick-snapshotted threshold, so one tick fetches and
         # decides on the same value even if apply_threshold() lands mid-tick.
@@ -2422,7 +2458,7 @@ class AutoSwitchEngine:
                 entry = entries.get(num)
                 value = usage.get(num)
                 planned_headroom = oauth.account_headroom(
-                    value if isinstance(value, dict) else None, self._models
+                    value if isinstance(value, dict) else None, self._models, now
                 )
                 if (
                     entry is not None
@@ -2439,8 +2475,8 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
-        headroom = _headroom_by_account(usage, self._models)
-        return entries, usage, headroom
+        headroom = _headroom_by_account(usage, self._models, now)
+        return entries, usage, headroom, now
 
     def _perform(
         self,
@@ -2591,12 +2627,14 @@ class AutoSwitchEngine:
                 continue
             blocked = [
                 resets_at
-                for _, pct, resets_at in oauth.relevant_windows(value, self._models)
+                for _, pct, resets_at in oauth.relevant_windows(
+                    value, self._models, now
+                )
                 if pct >= 100.0
             ]
             if not blocked:
                 continue  # not exhausted — doesn't gate the blocked state
-            usable_at = _limiting_reset_ts(value, self._models)
+            usable_at = _limiting_reset_ts(value, self._models, now)
             if usable_at is None or usable_at <= now:
                 return None  # blocked with unprovable recovery — don't oversleep
             if earliest is None or usable_at < earliest:

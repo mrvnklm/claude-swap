@@ -13,14 +13,20 @@ import json
 import logging
 import os
 import plistlib
+import re
 import sys
 from pathlib import Path
 
 import pytest
 
-from claude_swap import menubar
+from claude_swap import menubar, oauth
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.switcher import SENTINEL_NOTES, USAGE_API_KEY
+
+
+def _ts(iso: str) -> float:
+    """Epoch of an ISO stamp, for pinning ``now`` against fixed windows."""
+    return _dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
 # --- notification identity -----------------------------------------------------
@@ -1522,3 +1528,142 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+# --- display / decision parity -------------------------------------------------
+
+
+class TestDisplayAndDecisionAgree:
+    """The menu bar and the engine must read the same windows the same way.
+
+    Measured divergence this pins (slot 5 of the real store): a scoped "Fable"
+    window at 98% whose ``resets_at`` was 17 days old. The menu bar rendered
+    "Fable 0%" (it rolled the weekly window forward); the decision path took
+    the 98% at face value. At >=100 that gap makes ``next-available`` skip an
+    account the menu bar shows as empty.
+
+    The rule now lives once, in ``oauth.rolled_weekly_window``, and both
+    surfaces read it through ``oauth.relevant_windows``. This test fails the
+    moment either side grows its own copy again.
+    """
+
+    NOW = _ts("2026-09-18T12:00:00Z")
+
+    # Each case is the same bytes fed to both surfaces.
+    CASES = {
+        "scoped reset 17 days past": {
+            "five_hour": {"pct": 70.0, "resets_at": "2026-09-18T14:00:00Z"},
+            "seven_day": {"pct": 40.0, "resets_at": "2026-09-20T09:00:00Z"},
+            "scoped": [
+                {"name": "Fable", "pct": 98.0, "resets_at": "2026-09-01T09:00:00Z"},
+            ],
+        },
+        "scoped reset 17 days past at 100": {
+            "five_hour": {"pct": 12.0, "resets_at": "2026-09-18T14:00:00Z"},
+            "seven_day": {"pct": 40.0, "resets_at": "2026-09-20T09:00:00Z"},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "resets_at": "2026-09-01T09:00:00Z"},
+            ],
+        },
+        "scoped reset missing": {
+            "five_hour": {"pct": 12.0, "resets_at": "2026-09-18T14:00:00Z"},
+            "seven_day": {"pct": 40.0, "resets_at": "2026-09-20T09:00:00Z"},
+            "scoped": [{"name": "Fable", "pct": 100.0}],
+        },
+        "scoped reset unparseable": {
+            "five_hour": {"pct": 12.0, "resets_at": "2026-09-18T14:00:00Z"},
+            "seven_day": {"pct": 40.0, "resets_at": "2026-09-20T09:00:00Z"},
+            "scoped": [
+                {"name": "Fable", "pct": 100.0, "resets_at": "whenever"},
+            ],
+        },
+        "weekly reset past": {
+            "five_hour": {"pct": 12.0, "resets_at": "2026-09-18T14:00:00Z"},
+            "seven_day": {"pct": 99.0, "resets_at": "2026-09-02T09:00:00Z"},
+            "scoped": [
+                {"name": "Fable", "pct": 30.0, "resets_at": "2026-09-22T09:00:00Z"},
+            ],
+        },
+        "weekly reset missing": {
+            "five_hour": {"pct": 12.0, "resets_at": "2026-09-18T14:00:00Z"},
+            "seven_day": {"pct": 99.0},
+            "scoped": [
+                {"name": "Fable", "pct": 30.0, "resets_at": "2026-09-22T09:00:00Z"},
+            ],
+        },
+        "five hour reset past is not weekly": {
+            "five_hour": {"pct": 99.0, "resets_at": "2026-09-01T09:00:00Z"},
+            "seven_day": {"pct": 40.0, "resets_at": "2026-09-20T09:00:00Z"},
+            "scoped": [
+                {"name": "Fable", "pct": 30.0, "resets_at": "2026-09-22T09:00:00Z"},
+            ],
+        },
+        "nothing has a reset": {
+            "five_hour": {"pct": 99.0},
+            "seven_day": {"pct": 99.0},
+            "scoped": [{"name": "Fable", "pct": 99.0}],
+        },
+    }
+
+    @staticmethod
+    def _displayed(usage: dict, now: float) -> dict[str, int]:
+        """``{label: rounded pct}`` as the menu bar actually prints it.
+
+        Parsed back out of the rendered string rather than recomputed, so a
+        renderer that stops using the shared rule is caught. ``spend`` is a
+        separate axis and is dropped, matching ``relevant_windows``.
+        """
+        out: dict[str, int] = {}
+        for segment in menubar.usage_summary(usage, now).split(" · "):
+            m = re.match(r"^(.+?) (\d+)%", segment)
+            assert m, f"unparsed menu-bar segment: {segment!r}"
+            if m.group(1) == "$":
+                continue
+            out[m.group(1)] = int(m.group(2))
+        return out
+
+    @staticmethod
+    def _decided(usage: dict, now: float) -> dict[str, int]:
+        """``{label: rounded pct}`` as the decision path reads the same bytes."""
+        return {
+            name: round(pct)
+            for name, pct, _ in oauth.relevant_windows(usage, ("Fable",), now=now)
+        }
+
+    @pytest.mark.parametrize("case", sorted(CASES))
+    def test_every_window_reads_the_same_on_both_surfaces(self, case):
+        usage = self.CASES[case]
+        displayed = self._displayed(usage, self.NOW)
+        decided = self._decided(usage, self.NOW)
+        assert displayed == decided, (
+            f"{case}: the menu bar shows {displayed} while the engine decides "
+            f"on {decided} for the same bytes"
+        )
+
+    @pytest.mark.parametrize("case", sorted(CASES))
+    def test_the_title_agrees_with_the_decision_too(self, case):
+        # The title is a second renderer with its own roll-forward call sites.
+        usage = self.CASES[case]
+        settings = menubar.MenuBarSettings(
+            show_account_name=False, title_pct="both", title_scoped=True
+        )
+        title = menubar.format_title("a@example.com", usage, settings, self.NOW)
+        shown = [int(p) for p in re.findall(r"(\d+)%", title)]
+        decided = self._decided(usage, self.NOW)
+        assert shown == [decided["5h"], decided["7d"], decided["Fable"]], (
+            f"{case}: title {title!r} disagrees with the decision {decided}"
+        )
+
+    def test_a_barred_account_is_barred_on_both_surfaces(self):
+        """The consequence that made this worth fixing.
+
+        ``next-available`` skips an account whose headroom is <= 0. Whenever
+        the menu bar prints a window at 100%, that must be exactly when the
+        engine refuses the account — never one without the other.
+        """
+        for case, usage in sorted(self.CASES.items()):
+            displayed = self._displayed(usage, self.NOW)
+            headroom = oauth.account_headroom(usage, ("Fable",), self.NOW)
+            assert (max(displayed.values()) >= 100) == (headroom <= 0), (
+                f"{case}: menu bar shows {displayed} but headroom is {headroom}"
+            )

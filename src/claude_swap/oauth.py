@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -344,6 +345,54 @@ def build_token_status(credentials: str) -> str | None:
     return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
 
 
+WEEKLY_PERIOD_S = 7 * 86400  # weekly limits reset on a fixed 7-day cadence
+
+
+def parse_reset_ts(resets_at: object) -> float | None:
+    """POSIX timestamp of a window's ``resets_at``, or None if missing/bad.
+
+    The one parser for reset timestamps: display, decision and scheduling all
+    read the same string, so they must not disagree about whether it parses.
+    """
+    if not isinstance(resets_at, str) or not resets_at:
+        return None
+    try:
+        return datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def rolled_weekly_window(window: dict | None, now: float) -> dict | None:
+    """A weekly window with a passed reset advanced to its next 7-day boundary.
+
+    Weekly limits reset on a fixed weekly cadence, so once the stored
+    ``resets_at`` is in the past we know the window rolled over — the stored pct
+    belongs to a window that no longer exists. Return a copy reflecting the reset
+    state (``pct`` 0, ``resets_at`` advanced to the next future boundary) so both
+    the menu bar and the decision path see the reset from the static schedule
+    alone, without waiting to spend tokens on a fresh fetch.
+
+    **A window with no parseable ``resets_at`` is returned unchanged** — it is
+    UNKNOWN, not free, and keeps gating with its stored pct. Reading "no reset
+    timestamp" as "window is empty" would be a fail-open that accepts an account
+    sitting at 100% as a switch target. Future windows are likewise unchanged.
+    """
+    if not isinstance(window, dict):
+        return window
+    ts = parse_reset_ts(window.get("resets_at"))
+    if ts is None or ts > now:
+        return window
+    missed = int((now - ts) // WEEKLY_PERIOD_S) + 1
+    rolled = dict(window)
+    rolled["pct"] = 0.0
+    rolled["resets_at"] = datetime.fromtimestamp(
+        ts + missed * WEEKLY_PERIOD_S, tz=timezone.utc
+    ).isoformat()
+    rolled.pop("countdown", None)  # recomputed live from the rolled resets_at
+    rolled.pop("clock", None)
+    return rolled
+
+
 def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
@@ -536,7 +585,7 @@ def build_usage_result(data: dict) -> dict | None:
 
 
 def relevant_windows(
-    usage: dict | None, models: Sequence[str] = ()
+    usage: dict | None, models: Sequence[str] = (), now: float | None = None
 ) -> list[tuple[str, float, str | None]]:
     """Every ``(label, pct, resets_at)`` window that gates this account.
 
@@ -547,14 +596,26 @@ def relevant_windows(
     canonical window source for decisions, scheduling, and reset math — so a
     window that binds a decision can never be invisible to the scheduler.
     ``spend`` (pay-as-you-go extra-usage credits) is a separate axis and is
-    deliberately excluded. ``resets_at`` is the ISO string as fetched, or
-    ``None`` when the API sent none.
+    deliberately excluded.
+
+    The **weekly** windows (7d and every scoped one) pass through
+    :func:`rolled_weekly_window` against ``now`` (wall clock when omitted), so
+    a stored reset that has already elapsed reads as ``pct`` 0 with its next
+    boundary — the same answer the menu bar renders from the same data. Before
+    this, a 17-day-old scoped measurement of 98% could make ``next-available``
+    skip an account the menu bar was showing at 0%. The 5-hour window is not
+    weekly and is never rolled. ``resets_at`` is the ISO string as fetched, the
+    rolled boundary for a rolled window, or ``None`` when the API sent none.
     """
     if not isinstance(usage, dict):
         return []
+    if now is None:
+        now = time.time()
     windows: list[tuple[str, float, str | None]] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
+        if key == "seven_day":
+            window = rolled_weekly_window(window, now)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             windows.append((label, float(window["pct"]), window.get("resets_at")))
     if models:
@@ -569,12 +630,15 @@ def relevant_windows(
                     and isinstance(s.get("name"), str)
                     and (match_all or s["name"].lower() in wanted)
                 ):
-                    windows.append((s["name"], float(s["pct"]), s.get("resets_at")))
+                    rolled = rolled_weekly_window(s, now)
+                    windows.append(
+                        (s["name"], float(rolled["pct"]), rolled.get("resets_at"))
+                    )
     return windows
 
 
 def account_headroom(
-    usage: dict | None, models: Sequence[str] = ()
+    usage: dict | None, models: Sequence[str] = (), now: float | None = None
 ) -> float | None:
     """Remaining percentage before this account hits a rate-limit window.
 
@@ -588,7 +652,7 @@ def account_headroom(
     or carries no window data, which callers treat as "unknown" (never
     auto-skipped).
     """
-    pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
+    pcts = [pct for _, pct, _ in relevant_windows(usage, models, now)]
     if not pcts:
         return None
     return 100.0 - max(pcts)
