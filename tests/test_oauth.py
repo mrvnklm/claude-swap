@@ -12,6 +12,11 @@ import pytest
 from claude_swap import oauth
 
 
+def _ts(iso: str) -> float:
+    """Epoch of an ISO stamp, for pinning ``now`` in window tests."""
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
 class TestExtractAccessToken:
     """Test extract_access_token."""
 
@@ -137,7 +142,11 @@ class TestRelevantWindows:
                 {"name": "Fable", "pct": 95.0, "resets_at": "2026-07-12T09:00:00Z"},
             ],
         }
-        assert oauth.relevant_windows(usage, ["Fable"]) == [
+        # Pinned to a `now` BEFORE both stamps: without it the assertion drifts
+        # from "carries the values" to "rolls the weekly ones" the moment wall
+        # clock passes 2026-07-12, which is exactly what happened here.
+        before = _ts("2026-07-09T00:00:00Z")
+        assert oauth.relevant_windows(usage, ["Fable"], now=before) == [
             ("5h", 80.0, "2026-07-10T12:00:00Z"),
             ("7d", 20.0, None),
             ("Fable", 95.0, "2026-07-12T09:00:00Z"),
@@ -150,6 +159,138 @@ class TestRelevantWindows:
     def test_non_dict_usage_is_empty(self):
         assert oauth.relevant_windows(None) == []
         assert oauth.relevant_windows("no credentials") == []
+
+
+class TestRolledWeeklyWindow:
+    """A weekly window with an elapsed reset is known-zero, not stale.
+
+    The rule used to live only in `menubar._rolled_weekly_window`, so the
+    display and the decision path gave different answers for the same bytes.
+    """
+
+    NOW = _ts("2026-09-18T12:00:00Z")
+
+    def test_a_passed_reset_zeroes_the_pct(self):
+        rolled = oauth.rolled_weekly_window(
+            {"name": "Fable", "pct": 98.0, "resets_at": "2026-09-01T09:00:00Z"},
+            self.NOW,
+        )
+        assert rolled["pct"] == 0.0
+        assert rolled["name"] == "Fable"  # identity survives the roll
+
+    def test_the_rolled_reset_lands_on_a_future_seven_day_boundary(self):
+        # 2026-09-01 is 17 days back: two whole weeks have elapsed, so the next
+        # boundary is 2026-09-01 + 21d. A plain "+7d" would still be in the past.
+        rolled = oauth.rolled_weekly_window(
+            {"pct": 98.0, "resets_at": "2026-09-01T09:00:00Z"}, self.NOW
+        )
+        ts = oauth.parse_reset_ts(rolled["resets_at"])
+        assert ts > self.NOW
+        assert (ts - _ts("2026-09-01T09:00:00Z")) % oauth.WEEKLY_PERIOD_S == 0
+        assert ts - self.NOW <= oauth.WEEKLY_PERIOD_S  # the NEXT one, not a later one
+
+    def test_a_future_reset_is_untouched(self):
+        window = {"pct": 98.0, "resets_at": "2026-09-19T09:00:00Z"}
+        assert oauth.rolled_weekly_window(window, self.NOW) == window
+
+    def test_a_missing_reset_is_unknown_not_free(self):
+        # The sharp edge, on purpose: no timestamp must NOT read as "empty".
+        # Zeroing here would be a fail-open that accepts a maxed account as a
+        # switch target.
+        window = {"name": "Fable", "pct": 100.0}
+        assert oauth.rolled_weekly_window(window, self.NOW) == window
+
+    def test_an_unparseable_reset_is_unknown_not_free(self):
+        window = {"name": "Fable", "pct": 100.0, "resets_at": "next tuesday"}
+        assert oauth.rolled_weekly_window(window, self.NOW) == window
+
+    def test_the_stale_countdown_strings_are_dropped_on_a_roll(self):
+        # They were computed against the window that no longer exists.
+        rolled = oauth.rolled_weekly_window(
+            {
+                "pct": 98.0,
+                "resets_at": "2026-09-01T09:00:00Z",
+                "countdown": "2h 0m",
+                "clock": "09:00",
+            },
+            self.NOW,
+        )
+        assert "countdown" not in rolled and "clock" not in rolled
+
+    def test_the_input_dict_is_not_mutated(self):
+        window = {"pct": 98.0, "resets_at": "2026-09-01T09:00:00Z"}
+        oauth.rolled_weekly_window(window, self.NOW)
+        assert window["pct"] == 98.0
+
+    def test_non_dict_passes_through(self):
+        assert oauth.rolled_weekly_window(None, self.NOW) is None
+
+
+class TestRelevantWindowsRollsWeeklyWindows:
+    """The decision path applies the same rule the menu bar renders."""
+
+    NOW = _ts("2026-09-18T12:00:00Z")
+
+    def _usage(self, scoped_reset: str | None) -> dict:
+        scoped: dict = {"name": "Fable", "pct": 98.0}
+        if scoped_reset is not None:
+            scoped["resets_at"] = scoped_reset
+        return {
+            "five_hour": {"pct": 70.0, "resets_at": "2026-09-18T14:00:00Z"},
+            "seven_day": {"pct": 40.0, "resets_at": "2026-09-20T09:00:00Z"},
+            "scoped": [scoped],
+        }
+
+    def test_a_passed_scoped_reset_reads_zero(self):
+        # The measured shape: engine said 98, menu bar said 0.
+        windows = dict(
+            (name, pct)
+            for name, pct, _ in oauth.relevant_windows(
+                self._usage("2026-09-01T09:00:00Z"), ("Fable",), now=self.NOW
+            )
+        )
+        assert windows == {"5h": 70.0, "7d": 40.0, "Fable": 0.0}
+
+    def test_a_passed_scoped_reset_no_longer_bars_the_account(self):
+        usage = self._usage("2026-09-01T09:00:00Z")
+        usage["scoped"][0]["pct"] = 100.0
+        # Binding window is the 5h one at 70, not a 17-day-old 100% reading.
+        assert oauth.account_headroom(usage, ("Fable",), self.NOW) == 30.0
+
+    def test_a_scoped_window_without_a_reset_still_bars_the_account(self):
+        usage = self._usage(None)
+        usage["scoped"][0]["pct"] = 100.0
+        assert oauth.account_headroom(usage, ("Fable",), self.NOW) == 0.0
+
+    def test_an_unparseable_scoped_reset_still_bars_the_account(self):
+        usage = self._usage("not-a-timestamp")
+        usage["scoped"][0]["pct"] = 100.0
+        assert oauth.account_headroom(usage, ("Fable",), self.NOW) == 0.0
+
+    def test_the_seven_day_window_rolls_too(self):
+        usage = self._usage(None)
+        usage["seven_day"] = {"pct": 99.0, "resets_at": "2026-09-01T09:00:00Z"}
+        windows = dict((n, p) for n, p, _ in oauth.relevant_windows(usage, now=self.NOW))
+        assert windows["7d"] == 0.0
+
+    def test_the_five_hour_window_is_never_rolled(self):
+        # 5h is not a weekly cadence — a passed 5h reset means the reading is
+        # stale, not that the window is empty. Zeroing it would be a guess.
+        usage = self._usage(None)
+        usage["five_hour"] = {"pct": 99.0, "resets_at": "2026-09-01T09:00:00Z"}
+        windows = dict((n, p) for n, p, _ in oauth.relevant_windows(usage, now=self.NOW))
+        assert windows["5h"] == 99.0
+
+    def test_the_rolled_reset_is_what_the_scheduler_gets(self):
+        # Reset math reads the same tuple; a past stamp here would schedule a
+        # wake in the past.
+        stamps = {
+            name: resets_at
+            for name, _, resets_at in oauth.relevant_windows(
+                self._usage("2026-09-01T09:00:00Z"), ("Fable",), now=self.NOW
+            )
+        }
+        assert oauth.parse_reset_ts(stamps["Fable"]) > self.NOW
 
 
 class TestFormatReset:

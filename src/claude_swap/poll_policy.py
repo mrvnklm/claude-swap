@@ -147,19 +147,30 @@ ESCALATION_MARGIN_PCT = 15.0
 RESET_SLACK_S = 60.0
 
 
-def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
-    """Utilization of the binding (worst) relevant window, or None."""
-    headroom = oauth.account_headroom(usage, models)
+def binding_pct(
+    usage: dict | None, models: tuple[str, ...] = (), now: float | None = None
+) -> float | None:
+    """Utilization of the binding (worst) relevant window, or None.
+
+    ``now`` is the instant weekly windows are rolled against (wall clock when
+    omitted) — see ``oauth.relevant_windows``.
+    """
+    headroom = oauth.account_headroom(usage, models, now)
     return None if headroom is None else 100.0 - headroom
 
 
 def limiting_reset_ts(
-    usage: dict | None, models: tuple[str, ...] = ()
+    usage: dict | None, models: tuple[str, ...] = (), now: float | None = None
 ) -> float | None:
     """Epoch when the last of the ≥100% relevant windows resets (account
-    usable again)."""
+    usable again).
+
+    A weekly window whose stored reset has already elapsed rolls to 0% and so
+    stops counting as limiting at all — the account is usable now, not at some
+    long-past timestamp.
+    """
     latest: float | None = None
-    for _, pct, resets_at in oauth.relevant_windows(usage, models):
+    for _, pct, resets_at in oauth.relevant_windows(usage, models, now):
         if pct < 100.0:
             continue
         ts = parse_reset_ts(resets_at)
@@ -174,22 +185,17 @@ def earliest_future_reset_ts(
     """Epoch of the next relevant-window reset ahead of ``now``, any
     utilization."""
     earliest: float | None = None
-    for _, _, resets_at in oauth.relevant_windows(usage, models):
+    for _, _, resets_at in oauth.relevant_windows(usage, models, now):
         ts = parse_reset_ts(resets_at)
         if ts is not None and ts > now and (earliest is None or ts < earliest):
             earliest = ts
     return earliest
 
 
-def parse_reset_ts(resets_at: str | None) -> float | None:
-    if not resets_at:
-        return None
-    try:
-        return datetime.fromisoformat(
-            str(resets_at).replace("Z", "+00:00")
-        ).timestamp()
-    except ValueError:
-        return None
+# One parser for reset stamps, shared with display and decision (oauth).
+# A second copy would let scheduling and decision disagree about whether a
+# stamp parses at all.
+parse_reset_ts = oauth.parse_reset_ts
 
 
 def plan_after_fetch(
@@ -251,7 +257,7 @@ def plan_after_fetch(
         increased = max(base * POST_429_BACKOFF_MULT, POST_429_MIN_INTERVAL_S)
         interval = min(POST_429_MAX_INTERVAL_S, max(interval, increased))
 
-    headroom = oauth.account_headroom(new_usage, models)
+    headroom = oauth.account_headroom(new_usage, models, now)
     if headroom is not None and headroom <= 0:
         # Keep probing exhausted accounts: Anthropic can grant/reset quota
         # before the previously advertised timestamp. Preserve a wider
@@ -260,7 +266,7 @@ def plan_after_fetch(
 
     next_poll = now + interval * (1.0 + JITTER_FRAC * (2.0 * rng() - 1.0))
     if headroom is not None and headroom <= 0:
-        reset_ts = limiting_reset_ts(new_usage, models)
+        reset_ts = limiting_reset_ts(new_usage, models, now)
         if reset_ts is not None and reset_ts > now:
             next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
     else:

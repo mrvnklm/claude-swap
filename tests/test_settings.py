@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -20,6 +21,7 @@ from claude_swap.settings import (
     load_settings,
     load_ui_settings,
     merged_with_cli,
+    parse_model_names,
     save_settings,
     set_setting,
     settings_path,
@@ -355,3 +357,50 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestParseModelNames:
+    """``autoswitch.model`` → the tuple the engine and the manual strategies
+    both read. Untested until now: every mutation below survived the suite.
+    """
+
+    def test_a_plain_list_splits(self):
+        assert parse_model_names("Fable,Opus") == ("Fable", "Opus")
+
+    def test_surrounding_whitespace_is_trimmed(self):
+        # The `.strip()`. Hand-edited settings.json and shell quoting both
+        # produce " Opus"; without the trim the name never matches a scoped
+        # window's display name and the per-model gate silently does nothing.
+        assert parse_model_names("Fable, Opus") == ("Fable", "Opus")
+        assert parse_model_names("  Fable  ") == ("Fable",)
+        assert parse_model_names("\tFable\n,\tOpus ") == ("Fable", "Opus")
+
+    def test_an_all_whitespace_entry_is_dropped_not_kept_as_empty(self):
+        # Without the trim this yields a "" name, which matches no window and
+        # pads the tuple with a member that can never gate anything.
+        assert parse_model_names("Fable, ,Opus") == ("Fable", "Opus")
+        assert parse_model_names("   ") == ()
+
+    def test_a_trailing_comma_adds_nothing(self):
+        assert parse_model_names("Fable,") == ("Fable",)
+
+    def test_duplicates_collapse_case_insensitively_first_spelling_wins(self):
+        assert parse_model_names("Fable,fable,FABLE") == ("Fable",)
+        assert parse_model_names("fable,Fable") == ("fable",)
+
+    def test_order_is_preserved(self):
+        assert parse_model_names("Opus,Fable,Sonnet") == ("Opus", "Fable", "Sonnet")
+
+    def test_empty_and_none_are_no_models(self):
+        assert parse_model_names(None) == ()
+        assert parse_model_names("") == ()
+
+    def test_the_trim_survives_the_round_trip_into_relevant_windows(self):
+        # The reason the trim matters at all: the parsed names are matched
+        # against a scoped window's display name.
+        usage = {
+            "five_hour": {"pct": 1.0},
+            "scoped": [{"name": "Fable", "pct": 100.0}],
+        }
+        models = parse_model_names(" Fable ")
+        assert oauth.account_headroom(usage, models) == 0.0

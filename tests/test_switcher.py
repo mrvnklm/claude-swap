@@ -4256,26 +4256,31 @@ class TestDeadTokenQuarantine:
         run.assert_called_once()  # it was fetch-eligible, not pre-quarantined
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
-    def test_the_collector_hands_the_trust_bound_its_configured_models(
+    def test_a_passed_scoped_reset_rolls_instead_of_killing_429_trust(
         self, temp_home
     ):
-        """`models=models` at the record call site, not the default `()`.
+        """A weekly window whose reset elapsed is KNOWN-zero, not obsolete.
 
-        `entries()` honours the configured per-model windows when it bounds
-        429 trust, so a scoped window that ENDS the trust must be visible
-        wherever that trust is computed. Defaulted to `()` the window is
-        invisible and the row keeps serving data its own reset already killed.
+        This test used to assert the opposite: that a past scoped reset drove
+        the row to *unknown*, and it used that as the lever proving
+        `_collect_usage_entries` hands its configured `models` down to the
+        trust bound. `oauth.relevant_windows` now rolls every weekly window
+        (7d and scoped) forward on a passed reset, so the bound sees a FUTURE
+        boundary and the snapshot stays trustworthy — the menu bar was already
+        rendering that same window as 0%, and a row flipped to unknown while
+        the display reads 0% is the divergence this change removes.
 
-        Store-level tests pass `models=` themselves, so they hold with the
-        wiring cut. Measured: mutating this call site to `models=()` left the
-        whole suite green. This drives `_collect_usage_entries`, the only path
-        production reaches.
+        The lever is therefore gone on purpose: after the roll no weekly
+        window can present a past reset, so `models` can no longer change
+        `_rate_limited_trust_ok`'s answer at any instant (the 5-hour window,
+        which is not weekly and is never rolled, still can — and it is in
+        `relevant_windows` regardless of `models`). Rather than keep a test
+        whose mutation now survives, this pins the behaviour that replaced it,
+        end to end through the collector.
 
-        Unscoped windows sit far out; the Fable window resets in 30 minutes.
-        Asserted on what the row SERVES, not on the wait: the wait is the
-        server's deadline plus the margin either way. An earlier revision
-        trimmed it back to the deadline when the trust expired first, which was
-        measured wrong — see `test_the_trust_bound_never_shortens_a_429_wait`.
+        Unscoped windows sit far out, so the age-ceiling (not a reset) is the
+        only other thing that could end trust, and the staged age stays well
+        inside it.
         """
         from datetime import datetime, timezone
 
@@ -4364,19 +4369,34 @@ class TestDeadTokenQuarantine:
             switcher, "_run_usage_fetches", return_value={},
         ):
             fetched = switcher._collect_usage_entries(info, fetch={"2"})["2"]
-        assert fetched.decision_value() is None, (
-            f"the FETCHING path returned a row still serving last_good "
+        assert fetched.decision_value() is not None, (
+            f"the FETCHING path dropped the row to unknown "
             f"(trust_extended={fetched.trust_extended}) although its scoped "
-            "window has reset — :3581 never got the configured models"
+            "window merely rolled over — a rolled weekly window is known-zero, "
+            "not obsolete"
         )
 
         returned = switcher._collect_usage_entries(info, fetch=set())["2"]
-        assert returned.decision_value() is None, (
-            f"the collector RETURNED a row still serving last_good "
+        assert returned.decision_value() is not None, (
+            f"the collector RETURNED an unknown row "
             f"(trust_extended={returned.trust_extended}) although its scoped "
-            "window has reset — it never handed its configured models to the "
-            "bound"
+            "window merely rolled over"
         )
+
+        # And the decision reads that window exactly as the menu bar renders
+        # it: 0%, on the next 7-day boundary — not the frozen 90%.
+        windows = dict(
+            (name, pct)
+            for name, pct, _ in oauth.relevant_windows(
+                returned.decision_value(), ("Fable",)
+            )
+        )
+        assert windows["Fable"] == 0.0, (
+            f"the rolled scoped window still reads {windows['Fable']}% in the "
+            "decision path; the menu bar shows 0% for the same data"
+        )
+        # The unscoped windows did NOT roll — their resets are still ahead.
+        assert windows["5h"] == 25.0 and windows["7d"] == 10.0
 
     def test_readd_clears_quarantine(self, temp_home):
         # Re-adding an account (fresh credential) must lift the quarantine, so
