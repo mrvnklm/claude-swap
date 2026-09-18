@@ -14,7 +14,13 @@ The rules that make this readable:
   sleep. A reader never guesses an interval, and never treats "the process
   is alive" as evidence that the loop is turning — a live PID may only
   DEMOTE a verdict, never promote a stale beat to a healthy one.
-* **One beat per loop iteration.** ``cswap auto --once`` writes nothing: a
+* **One beat per tick**, carrying the distance to the next POLL rather than
+  to the next loop turn. The loop re-decides on stored data every few
+  seconds and only polls on its configured interval; if a beat promised the
+  decision cadence, an engine that keeps turning but has stopped polling
+  would renew a healthy verdict forever — this module's founding bug. A turn
+  that skips its tick (nothing due, nothing written) writes nothing.
+  ``cswap auto --once`` writes nothing either: a
   cron wrapper firing every few minutes would otherwise keep overwriting a
   dead long-running engine's file and make it look alive forever.
 * **Silence is armed by intent, not by the file.** An engine that never

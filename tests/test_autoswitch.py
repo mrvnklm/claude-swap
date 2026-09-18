@@ -5,19 +5,21 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from claude_swap import cancellation, oauth, poll_policy
+from claude_swap import autoswitch, cancellation, heartbeat, oauth, poll_policy
 from claude_swap.identity import identity_key
 from claude_swap.autoswitch import (
     _seven_day_reset_ts,
     strategy_sort_key,
     preference_order,
+    DECISION_INTERVAL_S,
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
@@ -641,6 +643,52 @@ class TestIdleHold:
         assert harness.tick_with_usage(self._HELD) is TickOutcome.SWITCHED
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "failover"
+
+    def test_the_dead_token_warning_follows_the_poll_cadence(
+        self, harness, caplog
+    ):
+        """The warning counts POLLS, like the counting it announces.
+
+        Sibling of ``test_unhealthy_counting_follows_the_poll_cadence_not_
+        the_tick``: that one pins the counter, this one pins the line that
+        reports it. Both hang off the same ``may_fetch`` gate and the
+        warning sat on the wrong side of it — so past the idle-hold cap it
+        was written once per loop turn rather than once per poll. A dead
+        refresh token with an active user lasts hours; at DECISION_INTERVAL_S
+        that is 12 identical lines a minute drowning the one log an operator
+        opens to find out why failover has not happened yet.
+        """
+        # Arm the hold clock, then walk past the cap: only there does the
+        # tick fall through to counting, which is what warns.
+        assert harness.tick_with_usage(self._HELD) is TickOutcome.NO_ACTION
+        harness.clock.advance(IDLE_HOLD_MAX_S + 1)
+        entries = {
+            num: _entry_for(value, harness.clock.now)
+            for num, value in self._HELD.items()
+        }
+
+        def tick(*, may_fetch):
+            with patch.object(harness.switcher, "usage_entries_by_account",
+                              return_value=entries):
+                return harness.engine.tick(may_fetch=may_fetch)
+
+        with caplog.at_level("WARNING", logger="claude_swap.autoswitch"):
+            # One poll's worth of turns: a poll tick and the decision ticks
+            # that follow it.
+            assert tick(may_fetch=True) is TickOutcome.NO_ACTION
+            for _ in range(11):
+                harness.clock.advance(DECISION_INTERVAL_S)
+                assert tick(may_fetch=False) is TickOutcome.NO_ACTION
+
+        warnings = [
+            r for r in caplog.records
+            if "dead refresh token" in r.getMessage()
+        ]
+        # Twelve turns, one poll, one line.
+        assert len(warnings) == 1
+        # And the decision ticks stayed out of the counter too, or the
+        # warning would merely be tracking a counter that is itself wrong.
+        assert harness.engine._unhealthy_ticks == 1
 
     def test_recovery_resets_the_hold_clock(self, harness):
         healthy = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
@@ -1707,6 +1755,441 @@ class TestAdaptiveScheduler:
         assert sw.trigger == "consume-first"
 
 
+class _SteppingUTC:
+    """A `datetime` stand-in whose `now()` steps forward on every call.
+
+    Events are stamped by `_now_iso()`, which reads the REAL wall clock --
+    the one clock the suite's FakeClock does not reach. Patched over
+    `autoswitch.datetime` (which `_now_iso` resolves from module globals on
+    each call) this moves that clock at a chosen cadence, so a test can put
+    the engine under the condition it actually runs in, while `_now_iso`'s
+    own formatting stays under test rather than mocked away.
+    """
+
+    def __init__(self, step_s: float, start: datetime | None = None):
+        self._step = timedelta(seconds=step_s)
+        self._at = start or datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self._calls = 0
+
+    def now(self, tz=None):
+        self._calls += 1
+        moment = self._at + self._step * self._calls
+        return moment if tz is None else moment.astimezone(tz)
+
+
+class TestDecisionCadence:
+    """Decision cadence split from poll cadence.
+
+    The loop used to sleep its whole ``interval_seconds``, so the decision
+    and the poll shared one beat and the engine sat on a usage measurement
+    that was already on disk for up to a minute. The decision now runs every
+    ``DECISION_INTERVAL_S``; the poll deadline stays where it was. The
+    condition that makes that safe — and the one the tests below exist for —
+    is that the 429 budget must not move: a tick without fresh data must not
+    fetch.
+
+    Instrumented through ``TestAdaptiveScheduler``'s counting fetch, which
+    counts real ``oauth.try_fetch_usage_for_account`` calls.
+    """
+
+    _harness = TestAdaptiveScheduler._harness
+    _tick = TestAdaptiveScheduler._tick
+    _counting_fetch = staticmethod(TestAdaptiveScheduler._counting_fetch)
+
+    @pytest.fixture(autouse=True)
+    def _no_profile_probe(self):
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            yield
+
+    def _drive(
+        self, h, counts, usage, *, decision_interval, horizon, churn=True
+    ):
+        """Run the real loop for ``horizon`` simulated seconds.
+
+        ``decision_interval`` is the only lever: a huge value reproduces the
+        pre-fix loop exactly (``min(delay, huge)`` is ``delay``), so two runs
+        differ in nothing but the decision cadence.
+
+        With ``churn`` the store is touched on every turn, standing in for
+        another cswap surface writing it (menubar, TUI, a ``cswap list`` in a
+        terminal). That defeats the loop's own unchanged-store skip on
+        purpose: it puts every single decision tick through a FULL tick,
+        which is the hard case for the budget claim rather than the easy one.
+
+        Returns ``(turns, ticks)`` — one entry per loop turn (the timeout it
+        slept) and one per tick that actually ran (its ``may_fetch``).
+        """
+        start = h.clock()
+        store_path = h.switcher._usage_store.path
+        turns: list[float] = []
+        ticks: list[bool] = []
+        real_tick = h.engine._tick_inner
+
+        def counting_tick(may_fetch=True):
+            ticks.append(may_fetch)
+            return real_tick(may_fetch)
+
+        def wait(timeout=None):
+            turns.append(timeout)
+            h.clock.advance(timeout or 0.0)
+            if churn and store_path.exists():
+                store_path.touch()
+            if h.clock() - start >= horizon:
+                h.engine.stop()
+
+        with patch("claude_swap.autoswitch.DECISION_INTERVAL_S",
+                   decision_interval), \
+             patch.object(autoswitch.random, "random", return_value=0.5), \
+             patch.object(h.engine, "_tick_inner", side_effect=counting_tick), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   side_effect=self._counting_fetch(counts, usage)), \
+             patch.object(h.engine._wake, "wait", side_effect=wait):
+            h.engine.run_loop()
+        return turns, ticks
+
+    def test_a_fast_decision_tick_does_not_raise_the_poll_budget(
+        self, temp_home, monkeypatch
+    ):
+        """The core condition, measured against the old loop rather than
+        against a number — no re-tuned constant can pass this.
+
+        The active account sits inside ``ESCALATION_MARGIN_PCT`` of the
+        threshold, so the escalation refetch is engaged the whole hour. That
+        is the one path in the engine that reserves with
+        ``respect_plans=False``: its ``poll_due or stale`` disjunct beats
+        every candidate plan (SERVE_TTL_S 180s against 300-600s plans) and is
+        today braked by nothing but the 60s tick quantisation. Untie the
+        decision from the tick without gating it and this is where the bill
+        arrives — measured +27% per candidate, silently.
+        """
+        usage = {"1": _usage(80), "2": _usage(10), "3": _usage(20)}
+
+        def fresh(monkeypatch):
+            # The two runs share one HOME (the conftest fixture patches the
+            # env once), so the second one must start from an empty store —
+            # otherwise it inherits rows timestamped an hour into its OWN
+            # clock's future, nothing is ever due again, and "0 fetches"
+            # would read as a saved budget.
+            h = self._harness(temp_home, monkeypatch)
+            h.switcher._usage_store.path.unlink(missing_ok=True)
+            h.engine.state_path.unlink(missing_ok=True)
+            return h
+
+        slow: dict[str, int] = {}
+        self._drive(
+            fresh(monkeypatch), slow, usage,
+            decision_interval=1e9, horizon=3600.0,
+        )
+
+        fast: dict[str, int] = {}
+        self._drive(
+            fresh(monkeypatch), fast, usage,
+            decision_interval=DECISION_INTERVAL_S, horizon=3600.0,
+        )
+
+        assert sum(slow.values()) > 0, "the reference run never polled"
+        for num in set(slow) | set(fast):
+            assert fast.get(num, 0) <= slow.get(num, 0), (
+                f"account {num}: {fast.get(num, 0)} fetches on the fast "
+                f"decision tick vs {slow.get(num, 0)} on the old loop"
+            )
+        # …and it did not buy that by going quiet, which is the other way to
+        # pass a "spends no more" test. Both runs are fully deterministic
+        # (pinned jitter, fake clock), so the budget is not merely bounded —
+        # it is the same budget, request for request. Measured 16/15/15 on
+        # both.
+        assert fast == slow, (
+            "the fast decision tick changed the poll budget: "
+            f"{fast} against the old loop's {slow}"
+        )
+
+    def test_a_decision_tick_acts_on_usage_another_surface_wrote(
+        self, temp_home, monkeypatch
+    ):
+        """The point of the whole change: react to a measurement that is
+        already on disk, without spending a request to learn it."""
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        counts: dict[str, int] = {}
+        assert self._tick(
+            h, counts, {"1": _usage(50), "2": _usage(10)}
+        ) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+        # Another surface polled #1 and stored 95% — over the threshold.
+        h.switcher._usage_store.record(
+            {"1": FetchRecord(usage=_usage(95))},
+            {"1": ("a@example.com", "")},
+        )
+        h.clock.advance(DECISION_INTERVAL_S)
+        counts.clear()
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._counting_fetch(counts, {}),
+        ):
+            outcome = h.engine.tick(may_fetch=False)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert counts == {}, "a decision tick must not fetch"
+
+    def test_unhealthy_counting_follows_the_poll_cadence_not_the_tick(
+        self, temp_home, monkeypatch
+    ):
+        """``unhealthy_ticks`` counts POLLS, not loop turns.
+
+        The most expensive way this change could go wrong: the counter is in
+        ticks, the default is 3, so a fast tick would fail over after 15
+        seconds of unreadable usage instead of 180 — a real account switch on
+        the operator's live session.
+        """
+        h = self._harness(temp_home, monkeypatch, accounts=2, unhealthy_ticks=3)
+        interval = h.engine.settings.interval_seconds
+        counts: dict[str, int] = {}
+        elapsed = 0.0
+        while elapsed < 2 * interval:
+            with patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                side_effect=self._counting_fetch(
+                    counts, {"2": _usage(10)}, {"1": "timeout"}
+                ),
+            ):
+                h.engine.tick(may_fetch=(elapsed % interval == 0))
+            h.clock.advance(DECISION_INTERVAL_S)
+            elapsed += DECISION_INTERVAL_S
+
+        # Two poll ticks in two intervals — not the 24 turns it took to get
+        # there.
+        assert h.engine._unhealthy_ticks == 2
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.active_number() == 1
+
+    def test_an_unchanged_store_costs_nothing_between_polls(
+        self, temp_home, monkeypatch
+    ):
+        """What makes the fast tick affordable at all.
+
+        A full tick is not free even with ``may_fetch=False``: every collect
+        pass goes through ``_build_accounts_info``, which on macOS shells out
+        to ``security find-generic-password`` and reads a backup per slot.
+        Twelve times a minute that competes with Claude Code's own credential
+        lock. So a decision tick that may not fetch and sees an unchanged
+        usage store — nobody wrote a new measurement — skips itself.
+        """
+        h = self._harness(temp_home, monkeypatch)
+        counts: dict[str, int] = {}
+        turns, ticks = self._drive(
+            h, counts, {"1": _usage(80), "2": _usage(10), "3": _usage(20)},
+            decision_interval=DECISION_INTERVAL_S,
+            horizon=h.engine.settings.interval_seconds - DECISION_INTERVAL_S,
+            churn=False,
+        )
+        assert len(turns) >= 10, "the loop did not actually turn"
+        assert ticks == [True], (
+            "a decision tick ran although nothing had written the store"
+        )
+
+    def test_a_repeating_decision_tick_stays_quiet(
+        self, temp_home, monkeypatch
+    ):
+        """`cswap auto` prints a line per event, the menubar appends every
+        event to a deque under a lock and the TUI writes them to a RichLog.
+        A decision tick that re-derives the previous answer word for word
+        must not say it again twelve times a minute — while a poll tick
+        always speaks, because that line is the proof it polled.
+        """
+        h = self._harness(temp_home, monkeypatch)
+        counts: dict[str, int] = {}
+        # THE POINT OF THIS TEST. Events are stamped from the real wall
+        # clock, not from the engine's clock, and in production successive
+        # decision ticks are DECISION_INTERVAL_S apart -- so their stamps
+        # differ. Left to the suite's standing wall clock every stamp comes
+        # out identical and the dedup looks like it works no matter how it
+        # is written; that is the false green this replaces. `_now_iso`
+        # resolves `datetime` from module globals on each call, so stepping
+        # that moves the wall clock while leaving `_now_iso` itself under
+        # test.
+        with patch.object(autoswitch, "datetime",
+                          _SteppingUTC(DECISION_INTERVAL_S)):
+            turns, ticks = self._drive(
+                h, counts, {"1": _usage(80), "2": _usage(10), "3": _usage(20)},
+                decision_interval=DECISION_INTERVAL_S,
+                horizon=h.engine.settings.interval_seconds - DECISION_INTERVAL_S,
+                churn=True,
+            )
+        # The stamps really advanced -- otherwise this proves nothing.
+        assert len({e.ts for e in h.events}) == len(h.events)
+        # The churn forced a full tick on every turn…
+        assert ticks.count(False) >= 10
+        # …and exactly one of them was allowed to speak.
+        assert len([e for e in h.events if isinstance(e, PollEvent)]) == 1
+        assert len([e for e in h.events if isinstance(e, NoSwitchEvent)]) == 1
+
+    def test_a_decision_tick_speaks_again_when_the_answer_changes(
+        self, temp_home, monkeypatch
+    ):
+        """The dedup must mute repetition, never news.
+
+        A dedup that compares how MANY events a tick emitted instead of WHAT
+        they said passes every quiet-loop assertion in this class and still
+        swallows the one thing the fast decision tick exists to deliver: a
+        measurement another surface just wrote. The event count does not
+        change when the numbers do, so only a content comparison can tell
+        the two apart -- and a silent `cswap auto` looks identical whether
+        there is nothing to report or the report was eaten.
+        """
+        h = self._harness(temp_home, monkeypatch)
+        counts: dict[str, int] = {}
+        usage = {"1": _usage(80), "2": _usage(10), "3": _usage(20)}
+        start = h.clock()
+        store_path = h.switcher._usage_store.path
+        horizon = h.engine.settings.interval_seconds - DECISION_INTERVAL_S
+        turns = {"n": 0}
+
+        def wait(timeout=None):
+            h.clock.advance(timeout or 0.0)
+            turns["n"] += 1
+            if turns["n"] == 5:
+                # Another surface polled #3 and stored a different number.
+                # #3 is a candidate and stays below threshold, so this
+                # changes what the tick SAYS without changing what it does.
+                h.switcher._usage_store.record(
+                    {"3": FetchRecord(usage=_usage(55))},
+                    {"3": ("c@example.com", "")},
+                )
+            elif store_path.exists():
+                store_path.touch()
+            if h.clock() - start >= horizon:
+                h.engine.stop()
+
+        with patch.object(autoswitch.random, "random", return_value=0.5), \
+             patch.object(autoswitch, "datetime",
+                          _SteppingUTC(DECISION_INTERVAL_S)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   side_effect=self._counting_fetch(counts, usage)), \
+             patch.object(h.engine._wake, "wait", side_effect=wait):
+            h.engine.run_loop()
+
+        polls = [e for e in h.events if isinstance(e, PollEvent)]
+        # The repeats stayed muted: one poll tick, one changed answer.
+        assert len(polls) == 2
+        # …and the changed measurement is what got through.
+        assert polls[0].headroom["3"] == 80.0
+        assert polls[1].headroom["3"] == 45.0
+        # No switch: this is a reporting change, not a decision change.
+        assert h.active_number() == 1
+
+    def test_the_heartbeat_deadline_does_not_slide_on_decision_ticks(
+        self, temp_home, monkeypatch
+    ):
+        """``nextTickBy`` promises the next POLL, not the next loop turn.
+
+        This is heartbeat's founding property, and splitting the cadences is
+        exactly what could break it: the loop now turns 12x per interval, so
+        a beat carrying the sleep it is about to take (``delay``) instead of
+        the distance to the fetch deadline (``remaining``) would push its own
+        freshness deadline forward every few seconds. An engine that keeps
+        turning but has stopped polling would then renew a healthy verdict
+        forever — the 36-hour ambiguity `heartbeat.py` was written for, back
+        with a faster clock.
+
+        `heartbeat.py:15-21` claims the property in prose and nothing held
+        it: swapping `remaining` for `delay` in `run_loop` left the whole
+        suite green. Measured under that swap: 30 distinct ``nextTickBy``
+        values over 150s of simulated time instead of 3.
+
+        Asserted per poll epoch, not globally: the deadline MUST move when a
+        poll tick re-arms it (the last assertion), and must not move for any
+        reason in between.
+        """
+        h = self._harness(temp_home, monkeypatch)
+        counts: dict[str, int] = {}
+        usage = {"1": _usage(80), "2": _usage(10), "3": _usage(20)}
+        start = h.clock()
+        store_path = h.switcher._usage_store.path
+        horizon = h.engine.settings.interval_seconds * 2
+        real_tick = h.engine._tick_inner
+        ticks: list[bool] = []
+        # (may_fetch of the tick that wrote this beat, its nextTickBy)
+        beats: list[tuple[bool, float]] = []
+
+        def counting_tick(may_fetch=True):
+            ticks.append(may_fetch)
+            return real_tick(may_fetch)
+
+        def wait(timeout=None):
+            # Read before advancing: this is the beat the turn just wrote.
+            beat = heartbeat.read_beat(h.switcher.backup_dir)
+            if ticks and beat is not None:
+                beats.append((ticks[-1], beat.next_tick_by))
+            h.clock.advance(timeout or 0.0)
+            # Churn, so the mtime gate opens and every turn is a FULL tick —
+            # the hard case: a skipped turn writes no beat at all.
+            if store_path.exists():
+                store_path.touch()
+            if h.clock() - start >= horizon:
+                h.engine.stop()
+
+        with patch.object(autoswitch.random, "random", return_value=0.5), \
+             patch.object(h.engine, "_tick_inner", side_effect=counting_tick), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   side_effect=self._counting_fetch(counts, usage)), \
+             patch.object(h.engine._wake, "wait", side_effect=wait):
+            h.engine.run_loop()
+
+        # Group the beats into poll epochs: a poll tick opens one, the
+        # decision ticks that follow belong to it.
+        epochs: list[list[float]] = []
+        for may_fetch, next_tick_by in beats:
+            if may_fetch:
+                epochs.append([next_tick_by])
+            elif epochs:
+                epochs[-1].append(next_tick_by)
+
+        assert len(epochs) >= 2, "fewer than two poll ticks — nothing measured"
+        for epoch in epochs:
+            assert len(epoch) >= 5, (
+                "no decision ticks between polls — nothing measured"
+            )
+            # Every beat in one epoch promises the SAME absolute instant.
+            assert max(epoch) - min(epoch) < 1e-6, (
+                f"the heartbeat deadline slid across {len(epoch)} turns of "
+                f"one poll interval: {max(epoch) - min(epoch):.1f}s"
+            )
+        # …and the counter-check, or a beat frozen at a constant would pass:
+        # a poll tick DOES re-arm the deadline.
+        assert len({e[0] for e in epochs}) == len(epochs)
+
+    def test_a_poll_tick_speaks_even_when_it_repeats_itself(
+        self, temp_home, monkeypatch
+    ):
+        """The other half of the dedup condition: `may_fetch or ...`.
+
+        A poll tick's line is the proof the engine polled, so it speaks even
+        when it re-derives the previous decision tick's answer word for
+        word. Deduping it away would leave `cswap auto` silent for minutes
+        on end and indistinguishable from an engine that had stopped
+        watching. Two poll intervals, so a SECOND poll tick has to get past
+        a `_last_tick_events` that already says exactly what it is about to
+        say -- the one-interval case cannot see this, because the first
+        poll's predecessor is None and would speak either way.
+        """
+        h = self._harness(temp_home, monkeypatch)
+        counts: dict[str, int] = {}
+        with patch.object(autoswitch, "datetime",
+                          _SteppingUTC(DECISION_INTERVAL_S)):
+            turns, ticks = self._drive(
+                h, counts, {"1": _usage(80), "2": _usage(10), "3": _usage(20)},
+                decision_interval=DECISION_INTERVAL_S,
+                horizon=h.engine.settings.interval_seconds * 2,
+                churn=True,
+            )
+        # Two poll ticks ran…
+        assert ticks.count(True) == 2
+        # …and both of them said so, though their words were identical.
+        polls = [e for e in h.events if isinstance(e, PollEvent)]
+        assert len(polls) == 2
+        assert polls[0].headroom == polls[1].headroom
+
+
 class TestApiKeyAccounts:
     def _mark_api_key(self, harness, num: int) -> None:
         data = harness.switcher._get_sequence_data()
@@ -2000,6 +2483,50 @@ class TestDryRunAndNoOp:
 
 
 class TestEventsShape:
+    def test_two_events_a_real_second_apart_are_the_same_event(self):
+        """Event identity is what an event SAYS, not when it was stamped --
+        asserted against the real wall clock, on purpose.
+
+        `run_loop`'s dedup compares whole tick sequences of these frozen
+        dataclasses. `ts` is stamped by `_now_iso()`, which reads the real
+        wall clock at second resolution and ignores the engine's injected
+        `self.clock` -- so no FakeClock in this suite moves it. That is
+        precisely how the dedup shipped unable to fire once while its test
+        stayed green. This test crosses a real second boundary, so it fails
+        the moment `ts` is back in the comparison base.
+        """
+        first = NoSwitchEvent(reason="below-threshold")
+        # Sleep just past the next second tick -- `_now_iso` has second
+        # resolution, so anything less can leave both stamps equal and hand
+        # us back the very false green this test exists to kill.
+        time.sleep(1.0 - (time.time() % 1.0) + 0.05)
+        second = NoSwitchEvent(reason="below-threshold")
+
+        # The wall clock really moved: without this the assertions below
+        # would hold for the wrong reason.
+        assert first.ts != second.ts
+        assert first == second
+        # The shape run_loop actually compares.
+        assert [first] == [second]
+
+    def test_events_that_say_different_things_stay_different(self):
+        """The complement, and the risk that comes with the fix above.
+
+        Dropping `ts` from event identity is only safe as long as it is the
+        ONLY thing dropped: widen it by one more field and the dedup stops
+        being a mute button for repetition and becomes one for news, which
+        is the failure nobody notices -- a silent `cswap auto` looks the
+        same whether there is nothing to report or the report was swallowed.
+        """
+        base = NoSwitchEvent(reason="below-threshold")
+        assert base != NoSwitchEvent(reason="cooldown")
+        assert base != NoSwitchEvent(reason="below-threshold", detail="#2")
+        assert base != PollEvent(
+            active={"number": 1}, headroom={"1": 20.0}, threshold=85.0
+        )
+        # And the sequence shape the dedup compares, not just the scalars.
+        assert [base] != [NoSwitchEvent(reason="cooldown")]
+
     def test_every_event_has_envelope(self, harness):
         harness.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(50)})
         assert harness.events
@@ -2026,8 +2553,9 @@ class TestEventsShape:
         assert "#3: ?" in line
 
     def test_poll_event_windows_match_the_decision_set(self, temp_home):
-        # Scoped windows appear only when configured: rendering an ignored
-        # Fable 100% next to a switch onto that account would read as a bug.
+        # The rendered windows are exactly the windows that decided. Blanket
+        # is the default, so scoped windows show by default too; an explicit
+        # `off` hides them again, and a narrowed list shows just that list.
         usage = {
             "1": _usage(42),
             "2": {
@@ -2044,9 +2572,17 @@ class TestEventsShape:
             h.make_live("a@example.com", 1)
             return h
 
-        plain = build()
-        plain.tick_with_usage(usage)
-        poll = next(e for e in plain.events if isinstance(e, PollEvent))
+        blanket = build()  # no `model=` → the blanket default
+        blanket.tick_with_usage(usage)
+        poll = next(e for e in blanket.events if isinstance(e, PollEvent))
+        assert "#2: 5h 3% · 7d 89% · Fable 21%" in poll.human()
+        assert poll.to_json()["windowsPct"]["2"] == {
+            "5h": 3.0, "7d": 89.0, "Fable": 21.0,
+        }
+
+        opted_out = build(model="off")
+        opted_out.tick_with_usage(usage)
+        poll = next(e for e in opted_out.events if isinstance(e, PollEvent))
         assert "#2: 5h 3% · 7d 89%" in poll.human()
         assert "Fable" not in poll.human()
         assert poll.to_json()["windowsPct"]["2"] == {"5h": 3.0, "7d": 89.0}
@@ -2060,25 +2596,41 @@ class TestEventsShape:
         }
 
 
+def _advancing_wait(harness):
+    """A ``_wake.wait`` stand-in that moves the engine's clock.
+
+    The loop no longer sleeps its whole poll interval, so a wait that returns
+    instantly without advancing anything spins forever on a frozen FakeClock
+    — in production the real sleep IS what moves the clock past the fetch
+    deadline. Advancing here reproduces that.
+    """
+    def wait(timeout=None):
+        harness.clock.advance(timeout or 0.0)
+    return wait
+
+
 class TestRunLoop:
     def test_loop_ticks_until_stopped(self, harness):
         ticks = []
 
-        def fake_tick():
+        def fake_tick(may_fetch=True):
             ticks.append(1)
             if len(ticks) >= 2:
                 harness.engine.stop()
             return TickOutcome.NO_ACTION
 
         with patch.object(harness.engine, "tick", side_effect=fake_tick), \
-             patch.object(harness.engine._wake, "wait", return_value=None):
+             patch.object(
+                 harness.engine._wake, "wait",
+                 side_effect=_advancing_wait(harness),
+             ):
             assert harness.engine.run_loop() == 0
         assert len(ticks) == 2
 
     def test_loop_survives_raising_tick(self, harness):
         calls = []
 
-        def raising_inner():
+        def raising_inner(may_fetch=True):
             calls.append(1)
             if len(calls) == 1:
                 raise RuntimeError("boom")
@@ -2087,7 +2639,9 @@ class TestRunLoop:
 
         with patch.object(
             harness.engine, "_tick_inner", side_effect=raising_inner
-        ), patch.object(harness.engine._wake, "wait", return_value=None):
+        ), patch.object(
+            harness.engine._wake, "wait", side_effect=_advancing_wait(harness)
+        ):
             harness.engine.run_loop()
         assert len(calls) == 2
         assert any(isinstance(e, ErrorEvent) for e in harness.events)
@@ -2107,7 +2661,7 @@ class TestRunLoop:
         # caught by the join timeout instead of hanging the suite.
         ticks: list[int] = []
 
-        def fake_tick():
+        def fake_tick(may_fetch=True):
             ticks.append(1)
             if len(ticks) == 1:
                 harness.engine.wake()  # e.g. apply_threshold landed mid-tick
@@ -2151,6 +2705,104 @@ class TestRunLoop:
             harness.engine._next_delay(TickOutcome.BLOCKED)
             == poll_policy.EXHAUSTED_INTERVAL_S
         )
+
+    def _record_first_sleep(self, harness, prepare, outcome):
+        """Run the loop for two turns; return every (slept, fetch-deadline)."""
+        slept: list[tuple[float, float]] = []
+
+        def fake_tick(may_fetch=True):
+            prepare()
+            if slept:
+                harness.engine.stop()
+            return outcome
+
+        def wait(timeout=None):
+            # The deadline is read BEFORE advancing, so it is the distance the
+            # loop actually promised from where it stood.
+            slept.append(
+                (timeout, harness.engine._next_fetch_at - harness.clock())
+            )
+            harness.clock.advance(timeout or 0.0)
+
+        with patch.object(harness.engine, "tick", side_effect=fake_tick), \
+             patch.object(harness.engine._wake, "wait", side_effect=wait):
+            harness.engine.run_loop()
+        return slept
+
+    def test_long_sleeps_survive_the_decision_cadence(self, harness):
+        """A deliberate long wait is slept whole — the fast decision tick
+        must not turn a 10-minute reset wait into 120 pointless turns.
+
+        Nothing a long wait waits for (a known reset, an exhausted fleet, an
+        idle Claude Code) can change without a poll, so re-deciding in
+        between buys nothing and costs a Keychain read per slot per turn.
+        """
+        def blocked_with_reset():
+            harness.engine._sleep_until_ts = harness.clock() + 1800
+
+        slept = self._record_first_sleep(
+            harness, blocked_with_reset, TickOutcome.BLOCKED
+        )
+        assert slept[0][0] == poll_policy.EXHAUSTED_INTERVAL_S
+        assert slept[0][0] > DECISION_INTERVAL_S
+
+    def test_an_idle_hold_is_slept_whole_too(self, harness):
+        def idle_hold():
+            harness.engine._idle_hold_slow = True
+
+        slept = self._record_first_sleep(
+            harness, idle_hold, TickOutcome.NO_ACTION
+        )
+        assert slept[0][0] == NO_RESET_FALLBACK_S
+        assert slept[0][0] > DECISION_INTERVAL_S
+
+    def test_an_exhausted_fleet_is_slept_whole_too(self, harness):
+        """The third ``_long_sleep`` branch — and the one that costs most if
+        it is lost.
+
+        ``_next_delay`` arms ``_long_sleep`` in three places, and until this
+        test the exhausted branch (``_blocked_wait_long``, no reset time
+        known) was the one nothing held: dropping the flag there left the
+        whole suite green. It is also the branch that lasts longest. A
+        known reset ends at a timestamp and an idle hold ends when the user
+        types; an exhausted fleet with no reset time known is precisely the
+        state nobody can date, and it is routinely hours. Without the flag
+        the loop drops from one turn per NO_RESET_FALLBACK_S to one per
+        DECISION_INTERVAL_S — 60x — and every one of those turns is a full
+        collect pass with a ``security find-generic-password`` per slot,
+        against Claude Code's own credential lock, to re-derive an answer
+        that by construction cannot change until the next poll.
+
+        Sibling of the two tests above; asserting through the loop rather
+        than through ``_next_delay`` on purpose, because the defect is not
+        in the delay (that stays NO_RESET_FALLBACK_S either way — see
+        ``test_blocked_exhausted_without_reset_uses_fallback``) but in
+        whether ``run_loop`` sleeps it or caps it at the decision cadence.
+        """
+        def exhausted():
+            harness.engine._sleep_until_ts = None  # no reset time known
+            harness.engine._blocked_wait_long = True
+
+        slept = self._record_first_sleep(
+            harness, exhausted, TickOutcome.BLOCKED
+        )
+        assert slept[0][0] == NO_RESET_FALLBACK_S
+        assert slept[0][0] > DECISION_INTERVAL_S
+
+    def test_the_normal_path_sleeps_the_decision_cadence_not_the_deadline(
+        self, harness
+    ):
+        """The counter-check to the two above, and the pin on the split
+        itself: on the normal path the loop sleeps the DECISION cadence while
+        the FETCH deadline stays a whole (jittered) ``interval_seconds`` out.
+        Collapsing the two back into one number fails here whichever way it
+        is done."""
+        slept = self._record_first_sleep(
+            harness, lambda: None, TickOutcome.NO_ACTION
+        )
+        interval = harness.engine.settings.interval_seconds
+        assert slept[0][0] == DECISION_INTERVAL_S
+        assert 0.9 * interval <= slept[0][1] <= 1.1 * interval
 
 
 class TestLoopObeysThePollPlan:
@@ -2221,8 +2873,9 @@ class TestSessionThreshold:
     def test_apply_threshold_retargets_trigger_and_poll_pin(self, harness):
         harness.engine.apply_threshold(72.0)
         assert harness.engine.settings.threshold == 72.0
-        # Poll-cadence planning follows the new value immediately.
-        assert harness.switcher._poll_inputs_override == (72.0, ())
+        # Poll-cadence planning follows the new value immediately — and keeps
+        # the engine's model scope, which is blanket by default.
+        assert harness.switcher._poll_inputs_override == (72.0, ("all",))
         # And the very next tick decides with it: 80% ≥ 72 switches, where
         # the constructed 90 would not have.
         outcome = harness.tick_with_usage({
@@ -2581,18 +3234,65 @@ class TestModelAwareSwitch:
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.to_ref == {"number": 2, "email": "b@example.com"}
 
-    def test_without_model_setting_the_same_usage_holds(self, temp_home):
-        # Default engine ignores scoped windows → #1 reads 5% used, no switch.
-        h = self._seed(temp_home)
+    def test_blanket_default_switches_on_a_maxed_scoped_window(self, temp_home):
+        """No `autoswitch.model` at all → scoped windows still bind.
+
+        This is the live bug of 2026-09-18 as an assertion, the right way
+        round: with the old `model = None` default the engine read #1 as 5%
+        used and held, while Fable sat at 100% on two machines for weeks.
+        The walk cannot know which model the next session drives, so the
+        worst scoped window binds unless someone opts out.
+        """
+        h = self._seed(temp_home)  # deliberately no model=
         outcome = h.tick_with_usage({
             "1": _model_usage(5, 100),
             "2": _model_usage(5, 30),
             "3": _model_usage(5, 60),
         })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2  # most Fable headroom
+
+    def test_a_null_model_field_cannot_reopen_the_hole(self, temp_home):
+        """`AutoSwitchSettings(model=None)` must still be blanket.
+
+        The dataclass default and `parse_model_names` back each other up here
+        on purpose, so neither alone is load-bearing — revert just one and
+        the test above still passes. This is the second half on its own:
+        `None` reaches the engine whenever someone builds settings in Python
+        rather than through `load_settings` (the engine takes what it is
+        handed, unclamped), and `parse_model_names` is the only thing between
+        that and an invisible gate.
+        """
+        h = self._seed(temp_home, model=None)
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            "2": _model_usage(5, 30),
+            "3": _model_usage(5, 60),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_explicit_opt_out_leaves_scoped_windows_invisible(self, temp_home):
+        """`autoswitch.model off` is the way back to 5h/7d only.
+
+        The NO_ACTION half alone would survive dropping the sentinel — a
+        literal model named "off" matches nothing and yields no windows
+        either. The ConfigWarningEvent half is what kills that mutation: an
+        unrecognised name reaches `_check_model_names` and gets warned about,
+        a real sentinel never does.
+        """
+        h = self._seed(temp_home, model="off")
+        usage = {
+            "1": _model_usage(5, 100),
+            "2": _model_usage(5, 30),
+            "3": _model_usage(5, 60),
+        }
+        outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
+        assert not [e for e in h.events if isinstance(e, ConfigWarningEvent)]
 
     def test_model_headroom_still_gated_by_session_window(self, temp_home):
         # Fable has room on every account, but #1's 5h is maxed → still leaves.
@@ -3073,7 +3773,7 @@ class TestConsumeFirstStrategy:
         assert reasons == ["reset-unknown"]
 
     def _two_phase_tick(
-        self, h: EngineHarness, stored: dict, fresh: dict
+        self, h: EngineHarness, stored: dict, fresh: dict, may_fetch: bool = True
     ) -> tuple[TickOutcome, list[set]]:
         """Drive one tick where stored-snapshot collections serve ``stored``
         and the all-candidates escalation serves ``fresh``.
@@ -3098,8 +3798,74 @@ class TestConsumeFirstStrategy:
         with patch.object(
             h.switcher, "usage_entries_by_account", side_effect=collect
         ):
-            outcome = h.engine.tick()
+            outcome = h.engine.tick(may_fetch=may_fetch)
         return outcome, fetch_sets
+
+    def test_a_decision_tick_skips_the_phase_two_refetch(self, temp_home):
+        """Phase 2 belongs to the poll tick.
+
+        It reserves with ``respect_plans=False``, so on a decision tick it
+        would beat every candidate plan by SERVE_TTL_S — consume-first fires
+        below the threshold, where nothing else escalates, so this is the one
+        place a fast tick could quietly multiply the 429 budget. The stored
+        snapshot is fresh here, so the switch still happens: a decision tick
+        may ACT on what is on disk, it may not go and get more.
+        """
+        h = self._harness(temp_home)
+        view = {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        outcome, fetch_sets = self._two_phase_tick(h, view, view, may_fetch=False)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert fetch_sets == [set()], "a decision tick requested a fetch"
+
+    def test_a_decision_tick_will_not_switch_on_a_stale_snapshot(
+        self, temp_home
+    ):
+        """The other half of the test above — and the line that makes it safe.
+
+        A decision tick may not run phase 2, so the ONLY thing standing
+        between it and a switch decided on arbitrarily old data is the
+        ``entry.fresh()`` gate. The test above proves a decision tick acts on
+        a fresh snapshot; nothing proved it refuses a stale one, and
+        consume-first fires below the threshold where no other escalation
+        exists to correct the picture. Losing the gate would mean switching
+        accounts on a reading up to CANDIDATE_MAX_INTERVAL_S old, 12x a
+        minute, with the phase-2 refetch that used to catch exactly that
+        (``test_two_phase_refetch_disqualifies_stale_pick``) skipped by
+        construction.
+
+        Held, not escalated: the tick reports ``stale-usage`` and retries.
+        """
+        h = self._harness(temp_home)
+        view = {
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        # Same ranking as the fresh case — only the age differs, so a
+        # failure here can be nothing but the freshness gate.
+        stale_at = h.clock.now - poll_policy.SERVE_TTL_S - 1
+
+        def collect(fetch=None, **_kwargs):
+            assert not fetch, "a decision tick requested a fetch"
+            return {
+                num: _entry_for(value, stale_at)
+                for num, value in view.items()
+            }
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            outcome = h.engine.tick(may_fetch=False)
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["stale-usage"]
 
     def test_two_phase_refetch_disqualifies_stale_pick(self, temp_home):
         # The stored snapshot ranks #2; the phase-2 refetch shows it

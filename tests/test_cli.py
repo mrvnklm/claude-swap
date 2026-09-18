@@ -188,7 +188,12 @@ class TestCLI:
         assert excinfo.value.code == 2
 
     def test_switch_strategy_forwarded(self):
-        """--switch --strategy best forwards the strategy to switch()."""
+        """--switch --strategy best forwards the strategy to switch().
+
+        With nothing configured the scope is the blanket `("all",)` — scoped
+        windows gate by default — but `model_source` stays None, so switch()
+        never announces a setting nobody set.
+        """
         from claude_swap.settings import AutoSwitchSettings
 
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
@@ -196,6 +201,25 @@ class TestCLI:
              patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.settings.load_settings",
                    return_value=AutoSwitchSettings()), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(
+            strategy="best", json_output=False,
+            models=("all",), model_source=None,
+        )
+
+    def test_switch_model_opt_out_reaches_the_strategies(self):
+        """`autoswitch.model off` is the only way back to no scoped windows —
+        and it IS a configured narrowing, so it stays unannounced only
+        because there is nothing left to announce."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch", "--strategy", "best"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.settings.load_settings",
+                   return_value=AutoSwitchSettings(model="off")), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
 

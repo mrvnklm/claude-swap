@@ -22,6 +22,14 @@ whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
 consecutive ticks, the engine fails over to any healthy candidate.
 
+DECIDING AND POLLING ARE TWO CADENCES. ``interval_seconds`` is the poll
+interval and nothing else: it is what the 429 budget is spent against. The
+loop re-decides every ``DECISION_INTERVAL_S`` on whatever the shared usage
+store already holds — any cswap surface may have written a fresh measurement
+there — and a tick that is not due to poll is told so (``may_fetch=False``)
+and cannot spend a request. This used to be one number, so the engine sat on
+a measurement that was already on disk for up to a full interval.
+
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
 read-modify-write under a dedicated file lock.
@@ -114,6 +122,17 @@ FRESHEN_BUFFER_MS = 10 * 60 * 1000
 # a long engine sleep must not suppress the fetch that discovers it.
 MAX_SLEEP_S = poll_policy.EXHAUSTED_INTERVAL_S
 NO_RESET_FALLBACK_S = 300.0
+
+# How often the loop *decides*, as opposed to how often it *polls*. The two
+# used to be one number: the loop slept its whole poll interval, so a usage
+# measurement another surface had already written sat unread for up to
+# ``interval_seconds``. The decision now runs on this fast beat while the
+# fetch deadline stays on the configured, budgeted cadence — a decision tick
+# is explicitly told it may not fetch (``may_fetch=False``), so the 429 budget
+# is unchanged by construction rather than by luck. Long sleeps (a known reset,
+# a truly exhausted fleet, an idle hold) are NOT cut to this: nothing can
+# change until the next poll, so ticking through them is pure cost.
+DECISION_INTERVAL_S = 5.0
 
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
 # NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
@@ -302,7 +321,20 @@ class AutoSwitchEvent:
     unknown ``event`` kinds and unknown fields."""
 
     kind: ClassVar[str] = "event"
-    ts: str = field(default_factory=_now_iso, kw_only=True)
+    # `compare=False` keeps `ts` out of `__eq__`: two events are the same
+    # event when they SAY the same thing, not when they were stamped.
+    # `run_loop`'s dedup (see `_last_tick_events`) compares whole tick
+    # sequences of these frozen dataclasses, and `_now_iso()` reads the real
+    # wall clock at second resolution -- NOT the injected `self.clock`. With
+    # `ts` in the comparison base, two decision ticks DECISION_INTERVAL_S
+    # apart can never compare equal, so the dedup could never once fire in
+    # production. Its test passed only because a FakeClock leaves the real
+    # wall clock standing still, which is what the test then measured.
+    # Fixing it here rather than by clocking `_now_iso` off `self.clock`
+    # leaves the outward payload untouched: `to_json()` -> `cli.py`'s
+    # `--json` stream still carries a true wall-clock stamp, which an engine
+    # built with a simulated clock would not.
+    ts: str = field(default_factory=_now_iso, kw_only=True, compare=False)
 
     def _fields(self) -> dict:
         return {}
@@ -537,10 +569,11 @@ def _window_pcts(
 ) -> dict[str, float]:
     """Ordered window label → pct: "5h", "7d", then configured scoped names.
 
-    Deliberately restricted to the windows the *decision* reads (same
-    ``models`` filter): showing an unconfigured scoped window at 100% next
-    to a switch onto that account would look like a bug, when the engine
-    correctly ignored it. Full per-model usage lives in ``cswap list``.
+    Restricted to the windows the *decision* reads (same ``models`` filter),
+    so a window shown here and a window that gated can never disagree. Under
+    the blanket default that is every scoped window the account reports; a
+    narrowed or disabled ``autoswitch.model`` shrinks both together. Full
+    per-model usage lives in ``cswap list``.
     """
     return {
         name: pct for name, pct, _ in oauth.relevant_windows(usage, models)
@@ -839,6 +872,28 @@ class AutoSwitchEngine:
         # longer than the normal interval.
         self._sleep_until_ts: float | None = None
         self._blocked_wait_long = False
+        # Set by ``_next_delay`` when the delay it returns is a deliberate
+        # long wait (known reset, exhausted fleet, idle hold) rather than the
+        # normal cadence — ``run_loop`` sleeps those whole instead of cutting
+        # them to DECISION_INTERVAL_S.
+        self._long_sleep = False
+        # Fetch deadline (wall clock). 0.0 means "the next tick may fetch",
+        # which is what a direct ``tick()`` — ``cswap auto --once``, the TUI,
+        # every test — must see: only ``run_loop`` ever moves this forward,
+        # so a cron-driven one-shot is never silently gated into fetching
+        # nothing.
+        self._next_fetch_at = 0.0
+        # Last usage-store mtime this engine has already decided on. A
+        # decision tick that may not fetch AND sees an unchanged store would
+        # repeat its own last answer at full price (a Keychain read per slot
+        # per collect), so it is skipped. Snapshotted *after* the tick, so the
+        # writes the tick itself caused never re-trigger it.
+        self._seen_store_mtime: int | None = None
+        # Per-tick event buffer + the previous tick's event list, so a
+        # decision tick that repeats itself verbatim stays silent instead of
+        # flooding `cswap auto`, the menubar deque and the TUI log.
+        self._tick_events: list[AutoSwitchEvent] | None = None
+        self._last_tick_events: list[AutoSwitchEvent] | None = None
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -1041,10 +1096,18 @@ class AutoSwitchEngine:
 
     # -- tick -----------------------------------------------------------------
 
-    def tick(self) -> TickOutcome:
-        """Evaluate once: poll usage, maybe switch. Never raises."""
+    def tick(self, may_fetch: bool = True) -> TickOutcome:
+        """Evaluate once: poll usage, maybe switch. Never raises.
+
+        ``may_fetch=False`` is a *decision-only* tick: it re-decides on
+        whatever the shared usage store already holds and is forbidden from
+        spending a single HTTP request. Only ``run_loop`` passes it; every
+        direct caller (``cswap auto --once``, the TUI, tests) gets the full
+        tick, so the poll budget is exactly what it was before the decision
+        cadence was split off.
+        """
         try:
-            return self._tick_inner()
+            return self._tick_inner(may_fetch)
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
             return TickOutcome.ERROR
@@ -1054,7 +1117,7 @@ class AutoSwitchEngine:
             )
             return TickOutcome.ERROR
 
-    def _tick_inner(self) -> TickOutcome:
+    def _tick_inner(self, may_fetch: bool = True) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
@@ -1100,7 +1163,8 @@ class AutoSwitchEngine:
         }
 
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current, quarantined, threshold=settings.threshold,
+            may_fetch=may_fetch,
         )
         self._emit(
             PollEvent(
@@ -1171,6 +1235,7 @@ class AutoSwitchEngine:
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
+            idle_hold_expired = False
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
                 # contention, unattributable lineage, failed persist, or the
@@ -1197,13 +1262,30 @@ class AutoSwitchEngine:
                 # Held far longer than any idle nap should need — likely a
                 # dead refresh token with an *active* user. Fall through to
                 # normal unhealthy counting so failover can still happen.
+                # The warning itself waits for the poll tick below: it
+                # announces the counting, and the counting is a POLL's job.
+                # Emitted here it would follow the decision cadence instead
+                # and repeat 12x a minute — for the whole duration of a dead
+                # refresh token, which is hours, in the one log an operator
+                # reads to find out why failover has not happened yet.
+                idle_hold_expired = True
+            else:
+                self._idle_hold_since = None
+            if not may_fetch:
+                # ``unhealthy_ticks`` counts POLLS that came back unreadable,
+                # not loop turns. Counting a decision tick — which is
+                # forbidden from fetching and therefore cannot possibly learn
+                # anything new — would turn the configured "3 failed polls"
+                # into 15 seconds and fail over on the operator's live
+                # session. Stay quiet: the poll tick that owns the counter is
+                # at most ``interval_seconds`` away.
+                return TickOutcome.NO_ACTION
+            if idle_hold_expired:
                 _logger.warning(
                     "Active token expired and owned for over %.0f minutes; "
                     "resuming unhealthy counting (dead refresh token?)",
                     IDLE_HOLD_MAX_S / 60,
                 )
-            else:
-                self._idle_hold_since = None
             self._unhealthy_ticks += 1
             if self._unhealthy_ticks < settings.unhealthy_ticks:
                 self._emit(
@@ -1400,7 +1482,7 @@ class AutoSwitchEngine:
             cancel_ends=cancel_ends,
         )
 
-        if trigger == "consume-first" and ordered:
+        if trigger == "consume-first" and ordered and may_fetch:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1408,7 +1490,15 @@ class AutoSwitchEngine:
             # A switch is imminent, so spend the fetches now and re-decide on
             # fresh data.
             # reserve() serves just-fetched accounts from the store, so this
-            # is cheap in-tick and plan-bounded across ticks. The trigger is
+            # is cheap in-tick; across ticks it is bounded by the POLL
+            # cadence, which is why the phase-2 refetch is gated on
+            # ``may_fetch``. It reserves with respect_plans=False (a plain
+            # ``poll_due or stale``), so on a decision tick it would beat
+            # every candidate plan by SERVE_TTL_S and quietly raise the 429
+            # budget — the one claim this whole change must not break. A
+            # decision tick therefore keeps the provisional ranking and lets
+            # the ``entry.fresh()`` gate below decide whether the stored
+            # snapshot is good enough to act on. The trigger is
             # deliberately NOT re-classified if the fresh active crossed the
             # threshold: a still-qualifying sooner target switches anyway,
             # and otherwise the next tick escalates normally and escapes.
@@ -2200,6 +2290,7 @@ class AutoSwitchEngine:
         quarantined: set[str] = frozenset(),
         *,
         threshold: float | None = None,
+        may_fetch: bool = True,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
@@ -2230,6 +2321,16 @@ class AutoSwitchEngine:
         Adapted cadences are persisted by the collector itself after each
         fetch (shared with every other surface), not by the engine.
 
+        ``may_fetch=False`` (a decision tick) collapses all of that to a pure
+        store read: no nomination, no escalation, not one request. The gate is
+        structural rather than a matter of trusting ``reserve()`` — both
+        fetching call sites below reserve with ``respect_plans=False``, whose
+        ``poll_due or stale`` disjunct is the only tick-rate-dependent fetch
+        in the engine (SERVE_TTL_S is shorter than every candidate plan, so
+        the stale half overtakes the plan and is today braked only by the 60s
+        tick quantisation). Gating on the tick's own permission is what keeps
+        "a tick without fresh data triggers no fetch" true by construction.
+
         Returns ``(entries, usage, headroom)`` where ``usage`` carries
         decision values and ``headroom`` the derived headroom per account.
         """
@@ -2243,6 +2344,9 @@ class AutoSwitchEngine:
         ]
 
         pre = self.switcher.usage_entries_by_account(fetch=set())
+        if not may_fetch:
+            usage = {num: entry.decision_value() for num, entry in pre.items()}
+            return pre, usage, _headroom_by_account(usage, self._models)
         plan: set[str] = set()
         active_pre = pre.get(current)
         # The active account is nominated when never fetched, poll-due per its
@@ -2502,7 +2606,22 @@ class AutoSwitchEngine:
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
+        if self._tick_events is not None:
+            self._tick_events.append(event)
+            return
         self.on_event(event)
+
+    def _store_mtime(self) -> int | None:
+        """mtime of the shared usage store, or None when it is unreadable.
+
+        Nanoseconds, not seconds: two writes inside one second are exactly
+        the case this has to notice. Same trick the menubar already uses on
+        ``~/.claude.json`` to watch for an active-account change at 1s.
+        """
+        try:
+            return self.switcher._usage_store.path.stat().st_mtime_ns
+        except OSError:
+            return None
 
     # -- loop -------------------------------------------------------------------
 
@@ -2514,7 +2633,14 @@ class AutoSwitchEngine:
         self._wake.set()
 
     def wake(self) -> None:
-        """Cut the current inter-tick sleep short and tick now."""
+        """Cut the current inter-tick sleep short and tick now.
+
+        A wake is a full tick, fetch permission included — that is what it
+        was before the decision cadence was split off, and what its callers
+        mean (``apply_threshold`` retargets the poll plan and wants the
+        answer measured against the new line, not re-derived from the old
+        measurement). The store's own plan still gates the actual request.
+        """
         self._wake.set()
 
     def apply_threshold(self, threshold: float) -> None:
@@ -2526,13 +2652,25 @@ class AutoSwitchEngine:
         self.switcher.set_poll_policy_inputs(threshold, self._models)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
+        """The FETCH deadline for the next turn, in seconds from now.
+
+        Since the decision cadence was split off this is no longer the sleep:
+        ``run_loop`` sleeps ``min(this, DECISION_INTERVAL_S)`` on the normal
+        path and re-decides in between. The three long-wait branches set
+        ``_long_sleep`` because nothing they wait for — a known reset, an
+        exhausted fleet, an idle Claude Code — can change without a poll, so
+        there they stay the sleep as well.
+        """
+        self._long_sleep = False
         interval = self.settings.interval_seconds
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:
                 delay = self._sleep_until_ts - self.clock()
+                self._long_sleep = True
                 return min(max(delay, interval), MAX_SLEEP_S)
             if self._blocked_wait_long:
                 # Truly exhausted with no reset time known / no candidates.
+                self._long_sleep = True
                 return max(interval, NO_RESET_FALLBACK_S)
             # Blocked on something that can resolve any tick (hysteresis,
             # unreadable usage) — keep the normal cadence so the at-limit
@@ -2541,6 +2679,7 @@ class AutoSwitchEngine:
             # Idle-hold: Claude is idle on an expired token — nothing changes
             # until the user comes back, so crawl. Worst case protection
             # resumes one slow tick after they do.
+            self._long_sleep = True
             return max(interval, NO_RESET_FALLBACK_S)
         # ±10% jitter so multiple machines don't synchronize their API hits.
         return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
@@ -2602,24 +2741,75 @@ class AutoSwitchEngine:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
             # already sees whatever settings that wake announced.
+            woken = self._wake.is_set()
             self._wake.clear()
             if self._stop.is_set():
                 return 0
+            may_fetch = woken or self.clock() >= self._next_fetch_at
+            if not may_fetch and self._store_mtime() == self._seen_store_mtime:
+                # Nothing is due and nobody has written a new measurement
+                # since we last looked: a decision tick would re-derive its
+                # own previous answer, and it is not free — every collect
+                # pass reads the Keychain once per slot, and at this cadence
+                # that competes with Claude Code's own credential lock. Wait
+                # again, capped so the fetch deadline is not overslept.
+                self._wake.wait(
+                    min(
+                        max(self._next_fetch_at - self.clock(), 0.0),
+                        DECISION_INTERVAL_S,
+                    )
+                )
+                continue
+            self._tick_events = []
             try:
-                outcome = self.tick()
+                outcome = self.tick(may_fetch=may_fetch)
             except Exception as e:  # pragma: no cover - tick() already guards
                 self._emit(
                     ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
                 )
                 outcome = TickOutcome.ERROR
+            finally:
+                emitted, self._tick_events = self._tick_events, None
+                # A decision tick that says exactly what the last tick said
+                # says nothing. `cswap auto` prints one line per event, the
+                # menubar appends every event to a bounded deque and the TUI
+                # writes them to a RichLog — at DECISION_INTERVAL_S that is a
+                # 12x flood of identical "below-threshold" lines for no new
+                # information. A poll tick always speaks: it is the proof the
+                # engine polled.
+                if may_fetch or emitted != self._last_tick_events:
+                    for event in emitted:
+                        self.on_event(event)
+                self._last_tick_events = emitted
+            # Absorb the store writes this tick caused (claims, poll plans,
+            # measurements) BEFORE arming the mtime gate, or the gate would
+            # re-trigger on our own hand and turn every fetch into a second,
+            # pointless full tick — the self-trigger loop.
+            self._seen_store_mtime = self._store_mtime()
             delay = self._next_delay(outcome)
-            # Exactly one beat per iteration, with the delay actually about to
-            # be slept, so the deadline a reader checks is the writer's own
-            # promise. `cswap auto --once` never reaches here and writes
-            # nothing: a cron wrapper must not keep a dead long-running
-            # engine's file looking alive.
-            self._beat(outcome, delay)
-            if delay > self.settings.interval_seconds * 1.5:
+            if may_fetch:
+                # ONLY a poll tick re-arms the poll deadline. Letting a
+                # decision tick do it pushes the deadline out by a full
+                # interval every few seconds, and the engine never polls
+                # again — measured: 3 fetches in a simulated hour instead of
+                # 46, which reads exactly like a saved budget and is an
+                # engine that has stopped watching.
+                self._next_fetch_at = self.clock() + delay
+            remaining = max(self._next_fetch_at - self.clock(), 0.0)
+            # One beat per iteration, carrying the distance to the FETCH
+            # deadline — not the (often much shorter) decision sleep.
+            # heartbeat's whole point is that a reader can tell a turning
+            # loop from a dead one without guessing an interval, and the
+            # deadline worth promising is the one by which this engine will
+            # have polled again. Because a decision tick cannot move that
+            # deadline, `nextTickBy` is an absolute instant that repeated
+            # decision ticks cannot slide forward — an engine that ticks but
+            # stops polling still goes stale on schedule, which is the exact
+            # 36-hour ambiguity this module was built for. `cswap auto
+            # --once` never reaches here and writes nothing: a cron wrapper
+            # must not keep a dead long-running engine's file looking alive.
+            self._beat(outcome, remaining)
+            if may_fetch and delay > self.settings.interval_seconds * 1.5:
                 until = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 self._emit(
                     SleepEvent(
@@ -2629,4 +2819,12 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-            self._wake.wait(delay)
+            # The decision cadence, not the poll cadence — except on a poll
+            # tick that asked for a deliberate long wait, which nothing but
+            # the next poll can end. A decision tick never extends anything:
+            # it decides on what is already on disk and hands the floor back.
+            self._wake.wait(
+                remaining
+                if (may_fetch and self._long_sleep)
+                else min(remaining, DECISION_INTERVAL_S)
+            )

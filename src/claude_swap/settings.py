@@ -26,6 +26,12 @@ from claude_swap.fsutil import replace_with_retry
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
 
+# ``autoswitch.model`` sentinels. "all" is the blanket scope (every scoped
+# window an account reports binds); the opt-out words switch scoped windows
+# back off entirely and leave the account-wide 5h/7d windows alone.
+MODEL_SCOPE_ALL = "all"
+MODEL_SCOPE_OFF: frozenset[str] = frozenset({"off", "none"})
+
 _logger = logging.getLogger("claude-swap")
 
 
@@ -58,6 +64,10 @@ class AutoSwitchSettings:
     # which keeps a config that never set these behaving exactly as before.
     threshold_five_hour: float | None = None
     threshold_weekly: float | None = None
+    # POLL cadence, not decision cadence — the two are separate since the
+    # engine got its own DECISION_INTERVAL_S (autoswitch.py). This is the
+    # number the 429 budget is spent against; the loop re-decides on stored
+    # data far more often than this and that costs nothing extra.
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -65,12 +75,18 @@ class AutoSwitchSettings:
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
-    # or "all" for every scoped window an account reports. Each named model's
-    # per-model weekly limit is folded into the binding window, so the engine
-    # switches off an account whose model quota is exhausted even while its
-    # 5h/7d windows still have headroom. None = account-wide 5h/7d only
-    # (default).
-    model: str | None = None
+    # or the blanket sentinel "all" for every scoped window an account
+    # reports. Each named model's per-model weekly limit is folded into the
+    # binding window, so the engine switches off an account whose model quota
+    # is exhausted even while its 5h/7d windows still have headroom.
+    # Default is BLANKET, not off: the walk cannot know which model the next
+    # session will drive, so any live scoped window over the line has to take
+    # the account out of rotation. Measured 2026-09-18: with the old `None`
+    # default two machines sat on a Fable-100% account and never switched,
+    # because scoped windows were invisible to headroom, pressure, ranking
+    # AND poll cadence at once. Opt OUT per install with
+    # ``autoswitch.model off`` (see MODEL_SCOPE_OFF).
+    model: str = MODEL_SCOPE_ALL
 
 
 @dataclass(frozen=True)
@@ -159,7 +175,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",
-            help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+            help="Models whose weekly limits also switch: all (default), a list like Fable,Opus, or off",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -182,15 +198,30 @@ def settings_path(backup_root: Path) -> Path:
 def parse_model_names(value: str | None) -> tuple[str, ...]:
     """Split a comma-separated model list, trimmed and case-insensitively
     deduped (first spelling wins). Shared by the auto engine and the manual
-    switch strategies so both read ``autoswitch.model`` identically."""
-    if not value:
+    switch strategies so both read ``autoswitch.model`` identically.
+
+    This is the gate for the blanket default. An unset value (``None`` or the
+    empty string) resolves to ``("all",)``, not ``()`` — every scoped window
+    counts unless someone says otherwise, because nothing in the walk knows
+    which model the next session will drive. The opt-out words
+    (``MODEL_SCOPE_OFF``) are the only way back to ``()``; they must be the
+    WHOLE value, so a model genuinely named "off" inside a list is still a
+    name. The clamp on load and every config reader come through here, so
+    ``AutoSwitchSettings(model=None)`` — still constructible in Python, and
+    the engine takes its settings raw — cannot reopen the hole.
+    """
+    if value is not None and value.strip().lower() in MODEL_SCOPE_OFF:
         return ()
+    if not value:
+        return (MODEL_SCOPE_ALL,)
     seen: dict[str, str] = {}
     for part in value.split(","):
         name = part.strip()
         if name and name.lower() not in seen:
             seen[name.lower()] = name
-    return tuple(seen.values())
+    # A value that is non-empty but carries no name ("   ", ",,") is garbage,
+    # and garbage reverts to the default here exactly as it does in `_clamped`.
+    return tuple(seen.values()) or (MODEL_SCOPE_ALL,)
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
@@ -223,8 +254,10 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
                 value = spec.default
             kwargs[spec.field] = value
         elif spec.kind == "string":
-            # A non-empty string keeps as-is; anything else reverts to default
-            # (None) so a null/garbage settings.json value disables the filter.
+            # A non-empty string keeps as-is; anything else reverts to the
+            # default — for `autoswitch.model` that is the blanket "all", so a
+            # null/garbage settings.json value leaves scoped windows VISIBLE
+            # rather than silently switching the gate off.
             kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
         else:  # choice
             if value not in spec.choices:

@@ -727,7 +727,7 @@ Defaults live in settings.json in the backup root; flags override them.
             print(
                 dimmed(
                     f"Auto-switch running: threshold {settings.threshold:.0f}%, "
-                    f"every {settings.interval_seconds:.0f}s"
+                    f"polling every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
@@ -1609,7 +1609,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 json_output=args.json,
             )
         elif args.switch:
-            from claude_swap.settings import load_settings, parse_model_names
+            from claude_swap.settings import (
+                AutoSwitchSettings,
+                load_settings,
+                parse_model_names,
+            )
 
             # Only the usage-aware strategies read model limits: --model wins;
             # otherwise the persistent autoswitch.model setting applies
@@ -1619,8 +1623,18 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             elif args.model is not None:
                 models, model_source = parse_model_names(args.model), "cli"
             else:
-                models = parse_model_names(load_settings(switcher.backup_dir).model)
-                model_source = "autoswitch.model" if models else None
+                configured = load_settings(switcher.backup_dir).model
+                models = parse_model_names(configured)
+                # NOT `if models`: since the blanket default, `models` is
+                # non-empty even when nobody configured anything, and hanging
+                # the source on it would make every `switch --strategy` claim
+                # "from autoswitch.model". Only a value that actually NARROWS
+                # (or disables) the scope is news worth announcing.
+                model_source = (
+                    "autoswitch.model"
+                    if models and configured != AutoSwitchSettings().model
+                    else None
+                )
             payload = switcher.switch(
                 strategy=args.strategy,
                 json_output=args.json,

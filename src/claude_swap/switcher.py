@@ -5874,11 +5874,14 @@ class ClaudeAccountSwitcher:
         warnings: list[str] = []
         if strategy_label == "rotation":
             models = ()  # model limits only steer the usage-aware strategies
-        if models and not json_output:
+        # Only announce a scope somebody CONFIGURED. The blanket default
+        # arrives here as ("all",) with no source; printing "Using configured
+        # model limits: all" for it would claim a setting that nobody set.
+        if models and model_source and not json_output:
             source = "--model" if model_source == "cli" else model_source
             print(dimmed(
                 f"Using configured model limits: {', '.join(models)}"
-                + (f" (from {source})" if source else "")
+                f" (from {source})"
             ))
 
         if not self.sequence_file.exists():

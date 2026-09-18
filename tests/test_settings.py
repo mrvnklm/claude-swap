@@ -222,11 +222,13 @@ class TestSetUnsetSetting:
             set_setting(tmp_path, "autoswitch.model", "   ")
         assert not settings_path(tmp_path).exists()
 
-    def test_garbage_model_value_falls_back_to_none(self, tmp_path: Path):
+    def test_garbage_model_value_falls_back_to_blanket(self, tmp_path: Path):
+        # A mistyped value must not silently switch the scoped gate OFF —
+        # it reverts to the blanket default like every other clamped key.
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"model": 123}})
         )
-        assert load_settings(tmp_path).model is None
+        assert load_settings(tmp_path).model == "all"
 
     def test_set_rejects_bool_words_strictly(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "FALSE") is False

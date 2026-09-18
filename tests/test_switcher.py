@@ -4277,6 +4277,68 @@ class TestDeadTokenQuarantine:
         assert not switcher._usage_store.entries({"1": identity})["1"].token_dead()
 
 
+class TestPollInputsModelScope:
+    """`_poll_policy_inputs()` is the hostless reader of `autoswitch.model`.
+
+    Everything without a running engine — plain CLI, the TUI before autoview
+    goes live, the menu bar's collector — gets its threshold and model scope
+    from here. A fix that lands in the config layer but not in this reader
+    would leave the cadence blind while every decision test stayed green:
+    exactly the failure mode `test_the_collector_hands_the_trust_bound_its_
+    configured_models` was written for, one call site over.
+    """
+
+    def test_an_unconfigured_file_still_yields_the_blanket_scope(
+        self, temp_home: Path
+    ):
+        from claude_swap.settings import AutoSwitchSettings, settings_path
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        assert not settings_path(s.backup_dir).exists()
+
+        threshold, models = s._poll_policy_inputs()
+
+        assert threshold == AutoSwitchSettings().threshold
+        assert models == ("all",)
+
+    def test_the_blanket_scope_reaches_the_poll_cadence(self, temp_home: Path):
+        """The consequence of the line above, at the place it is consumed.
+
+        Fable moving 84 → 88 sits inside the escalation band below a 90
+        threshold; the 5%-used 5h window alone would only decay the interval.
+        With the blanket scope the urgent cadence engages without anybody
+        having configured a model.
+        """
+        from claude_swap import poll_policy
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        threshold, models = s._poll_policy_inputs()
+
+        def usage(five_h, fable):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        _, interval = poll_policy.plan_after_fetch(
+            prev_interval_s=poll_policy.MIN_INTERVAL_S,
+            prev_usage=usage(5, 84),
+            new_usage=usage(5, 88),
+            is_active=True,
+            threshold=threshold,
+            models=models,
+            recent_429=False,
+            now=1000.0,
+            rng=lambda: 0.5,
+        )
+        assert interval == poll_policy.URGENT_INTERVAL_S
+
+
 class TestAddAccountOrgFields:
     def test_allows_same_email_different_org(self, temp_home):
         """Should allow adding same-email account if organizationUuid differs."""
@@ -5755,10 +5817,18 @@ class TestUsageAwareSwitch:
         assert "Skipping Account-2 (at Fable limit)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
-    def test_next_available_without_models_ignores_scoped(
+    def test_next_available_with_an_empty_model_tuple_ignores_scoped(
         self, temp_home: Path, capsys
     ):
-        """Default behavior unchanged: scoped windows are invisible."""
+        """The switch() API default is `()`, and `()` means 5h/7d only.
+
+        Not the same thing as the CONFIG default, which is blanket since
+        2026-09-18 — `parse_model_names` turns an unset `autoswitch.model`
+        into `("all",)` long before it reaches here. This pins the API half:
+        callers that deliberately pass no models (plain rotation, the
+        fetched_at-only reads, `_replan_new_active`) keep getting the
+        account-wide windows alone.
+        """
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com")
@@ -5778,6 +5848,51 @@ class TestUsageAwareSwitch:
         assert "Using configured model limits" not in out
         assert "Skipping" not in out
         assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_cli_switch_without_model_config_skips_a_maxed_scoped_candidate(
+        self, temp_home: Path, capsys
+    ):
+        """The whole fix through the real CLI path, nothing configured.
+
+        Every other test here calls `switch(models=...)` directly and so
+        jumps over `cli.py`'s reader. This one runs `cswap switch --strategy
+        next-available` against an empty settings.json and pins both halves
+        at once: the blanket scope arrives (#2 is skipped at its Fable limit
+        and we land on #3), and `model_source` stays None, so nothing claims
+        "from autoswitch.model" for a setting nobody wrote.
+        """
+        from claude_swap import cli
+        from claude_swap.settings import settings_path
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        assert not settings_path(s.backup_dir).exists()
+
+        usage = {
+            "1": self._model_usage(0, 10),
+            "2": self._model_usage(5, 100),
+            "3": self._model_usage(20, 20),
+        }
+        argv = ["claude-swap", "--switch", "--strategy", "next-available"]
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch.object(sys, "argv", argv), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None), \
+             patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            cli.main()
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (at Fable limit)" in out
+        # Two separate lies to guard against: naming a source that does not
+        # exist, and announcing a "configured" scope at all when the scope is
+        # just the default. The second survives the first assertion alone.
+        assert "from autoswitch.model" not in out
+        assert "Using configured model limits" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
 
     def test_best_noop_json_keeps_inert_model_warning(self, temp_home: Path):
         """The typo warning must survive into the JSON payload even when

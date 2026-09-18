@@ -55,6 +55,14 @@ class TestConfigList:
         ):
             assert key in out
         assert out.count("(default)") == 12
+        # The model scope must be READABLE as blanket here. Under the old
+        # `None` default this line said "(none)", which is what let a gate
+        # that silently watched nothing sit unnoticed on two machines.
+        model_line = next(
+            line for line in out.splitlines() if "autoswitch.model" in line
+        )
+        assert "all" in model_line
+        assert "(none)" not in model_line
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
