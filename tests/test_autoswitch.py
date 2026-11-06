@@ -373,14 +373,20 @@ class TestDecisionTable:
         assert harness.active_number() == 2
 
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
-        # threshold 80, hysteresis 5: the candidate at 85% is five points
+        # threshold 80, hysteresis 15: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
-        # and would re-trigger on the very next tick — blocked.
-        h = EngineHarness(temp_home, threshold=80.0, hysteresis_pct=5.0)
+        # and would re-trigger on the very next tick — blocked. The 79% peer
+        # keeps this out of the every-account-above escape, which drops the
+        # landing rule, and misses the 15-point margin itself. (Upstream
+        # 2179636: with the capped all-above margin, 15 pts against 10 moves.)
+        h = EngineHarness(temp_home, threshold=80.0, hysteresis_pct=15.0)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
-        outcome = h.tick_with_usage({"1": _usage(90), "2": _usage(85)})
+        outcome = h.tick_with_usage({
+            "1": _usage(90), "2": _usage(85), "3": _usage(79),
+        })
         assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
@@ -4262,6 +4268,63 @@ class TestEveryAccountAboveThreshold:
         )
         assert h.active_number() == 1
 
+    def _fleet_of(self, temp_home, n, **settings_kwargs):
+        h = EngineHarness(temp_home, **settings_kwargs)
+        for i in range(1, n + 1):
+            h.seed(i, f"{chr(96 + i)}@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @pytest.mark.parametrize(
+        "peer_pct, moves",
+        [(87.0, True), (87.1, False)],
+        ids=["13-points-moves", "12.9-points-holds"],
+    )
+    def test_the_margin_is_capped_at_spent_headroom_points(
+        self, temp_home, peer_pct, moves
+    ):
+        """Upstream 2179636, nur der Deckel: über SPENT_HEADROOM_PCT Headroom des
+        aktiven Accounts ist die Marge so viele Punkte, nicht das Doppelte. Ohne
+        Deckel verlangt das Verhältnis hier 20 Punkte und hält einen 90-%-Account,
+        während ein 87-%-Account brachliegt (bei uns: 5h-Linie 90, aktiv 95, Peer 91)."""
+        h = self._fleet_of(temp_home, 2, threshold=80.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(90),         # active, 10 pts
+            "2": _usage(peer_pct),
+        })
+        assert (outcome is TickOutcome.SWITCHED) is moves
+        assert h.active_number() == (2 if moves else 1)
+
+    @pytest.mark.parametrize(
+        "departure, recovery",
+        # Upstream prüft zusätzlich einen Fall unter dem Deckel (aktiv <= 3 Punkte).
+        # Den rankt dieser Fork bewusst nach Recovery (``_recovery_is_useful``), das
+        # Entfernen dieses Bands ist nicht mit portiert.
+        [((95, 85, 92), (81, 90, 87))],
+        ids=["above-cap"],
+    )
+    def test_a_recovered_account_clears_the_bar_at_the_capped_margin(
+        self, temp_home, departure, recovery
+    ):
+        """Die Freigabe der No-Return-Sperre verlangt dieselbe gedeckelte Marge wie
+        das Ranking. Verlangt sie mehr, bleibt Account 1 gesperrt, während 3 mit
+        weniger Platz die Marge schafft und den Wechsel bekommt."""
+        h = self._fleet_of(temp_home, 3, threshold=80.0)
+        assert h.tick_with_usage({
+            str(n): _usage(pct) for n, pct in zip((1, 2, 3), departure)
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400.0)
+
+        outcome = h.tick_with_usage({
+            str(n): _usage(pct) for n, pct in zip((1, 2, 3), recovery)
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1, (
+            f"landed on {h.active_number()} — account 1 has recovered and "
+            "holds the most room"
+        )
+
     def test_at_limit_trigger_still_ignores_the_landing_rule(self, harness):
         """at-limit and failover skip the whole proactive block. The escape
         must not have made the active account's 100% case *narrower* — an
@@ -5264,7 +5327,8 @@ class TestHorizonAxisDoesNotFlap:
         # 15 pts against an active on 10: does NOT clear `left >= active x 2`,
         # so the ratio release cannot fire and only the trigger check can
         # answer. A peer far ahead would pass for the wrong reason.
-        headroom = {"1": 15.0, "2": 10.0, "3": 1.0}
+        # 12 against 10: under the capped margin (13), so still barred (upstream 2179636).
+        headroom = {"1": 12.0, "2": 10.0, "3": 1.0}
         for trigger in ("at-limit", "failover"):
             for active in (10.0, None):
                 assert harness.engine._no_return_account(

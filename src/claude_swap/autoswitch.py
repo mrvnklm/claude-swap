@@ -188,6 +188,30 @@ HORIZON_HEADROOM_RATIO = 2.0
 SPENT_HEADROOM_PCT = 3.0
 
 
+def _all_above_margin_met(candidate_headroom: float, active_headroom: float) -> bool:
+    """Does a candidate beat the active by enough to move, every account over
+    its own switch lines?
+
+    Ported from upstream 2179636 (only the cap, not the removal of
+    ``_recovery_is_useful``). The margin is ``HORIZON_HEADROOM_RATIO`` times the
+    active's headroom, capped at ``SPENT_HEADROOM_PCT`` points. Either alone
+    fails a measured case:
+
+        no margin       active 5 pts, peer 6: moves, burns the point back,
+                        and moves again (four switches in 35 minutes)
+        ratio alone     active 10 pts, peer 19: holds a 90% account while an
+                        81% one sits idle
+
+    The no-return bar's release reuses this margin, so a recovered account
+    that clears it is never still barred while a poorer peer takes the move.
+    """
+    required = min(
+        active_headroom * HORIZON_HEADROOM_RATIO,
+        active_headroom + SPENT_HEADROOM_PCT,
+    )
+    return candidate_headroom >= required
+
+
 def _recovery_is_useful(
     candidate_recovery_ts: float,
     active_recovery_ts: float,
@@ -1817,7 +1841,7 @@ class AutoSwitchEngine:
         left_headroom = headroom.get(barred)
         if left_headroom is not None:
             if active_headroom is not None:
-                if left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO:
+                if _all_above_margin_met(left_headroom, active_headroom):
                     return None               # beats us outright; not a flip
             elif (
                 settings is not None
@@ -2236,7 +2260,7 @@ class AutoSwitchEngine:
                         # burns down to a quarter of what it beat can qualify
                         # in reverse. That takes a 4x relative burn instead of
                         # the one point a strictly-greater test would need.
-                        if h < (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO:
+                        if not _all_above_margin_met(h, active_headroom or 0.0):
                             if (
                                 (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
                                 and h >= (active_headroom or 0.0)
