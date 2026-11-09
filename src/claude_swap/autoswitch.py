@@ -163,7 +163,9 @@ RECOVERY_HORIZON_S = 4 * 3600.0
 
 # Anti-flap margin on the headroom axis, as a RATIO rather than percentage
 # points: strictly-more is no margin at all — one point moves the engine, the
-# target burns it back, and it ping-pongs. A ratio makes the move one-way.
+# target burns it back, and it ping-pongs. CAPPED at SPENT_HEADROOM_PCT points
+# (`_all_above_margin_met`, from upstream 2179636): uncapped, an active holding
+# 10 points refused a peer holding 19. The return leg is the no-return bar's.
 HORIZON_HEADROOM_RATIO = 2.0
 
 # The two anti-flap thresholds are both anchored to `active_headroom`, which
@@ -1747,7 +1749,7 @@ class AutoSwitchEngine:
 
         NEVER UNDO THE PREVIOUS MOVE. Each anti-flap gate is one-way on its own
         axis, but the axis is a property of the pair's STATE and burn changes
-        that state: the ratio gate is relative (`h >= active x 2`) and the
+        that state: the ratio gate is relative (`h >= min(active x 2, active + 3)`) and the
         spent gate absolute (`active <= 3.0`), so a burning pair crosses the
         boundary repeatedly and each crossing re-opens a move. Measured, both
         resets past the horizon, only the active burning: `[1, 2, 1, 2]` where
@@ -1797,8 +1799,8 @@ class AutoSwitchEngine:
             all(n == barred ...)              "does another account EXIST"
             (headroom.get(n) or 0.0) > 0.0    "is another account not at its limit"
 
-        The loop also applies the threshold, `h >= active x HORIZON_HEADROOM_
-        RATIO`, the spent fallback's `h >= active` plus a sooner reset, and the
+        The loop also applies the threshold, the capped margin
+        (`_all_above_margin_met`), the spent fallback's `h >= active` plus a sooner reset, and the
         recovery hysteresis. A third account on ONE point clears both
         predicates above and none of those, so the n=2 stall came back at n>=3
         and then again one point up. Measured: barred peer 3.5 pts / back in
@@ -2253,13 +2255,25 @@ class AutoSwitchEngine:
                         # impossible: the target must come back meaningfully
                         # sooner than where we are.
                         if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
-                            continue
+                            # Back later, but with clearly more room: the capped
+                            # margin admits it here too, or an active whose own
+                            # reset is near holds at 95% against a 91% peer and
+                            # burns into the hard limit (review 2026-11-06).
+                            # Not in the spent band, where a headroom edge is
+                            # noise and recovery alone decides. The return leg
+                            # is the no-return bar's: it holds until the account
+                            # we left has recovered.
+                            if (
+                                (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
+                                or not _all_above_margin_met(h, active_headroom or 0.0)
+                            ):
+                                continue
                     else:
-                        # Headroom axis, with a RATIO margin. Also a rate bound,
-                        # not impossibility — headroom moves, so a target that
-                        # burns down to a quarter of what it beat can qualify
-                        # in reverse. That takes a 4x relative burn instead of
-                        # the one point a strictly-greater test would need.
+                        # Headroom axis, with the capped margin
+                        # (`_all_above_margin_met`: min(2x active, active + 3)).
+                        # A rate bound, not impossibility — every further move
+                        # needs at least SPENT_HEADROOM_PCT points of burn, and
+                        # the return leg is the no-return bar's.
                         if not _all_above_margin_met(h, active_headroom or 0.0):
                             if (
                                 (active_headroom or 0.0) <= SPENT_HEADROOM_PCT

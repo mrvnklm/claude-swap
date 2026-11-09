@@ -4295,6 +4295,42 @@ class TestEveryAccountAboveThreshold:
         assert (outcome is TickOutcome.SWITCHED) is moves
         assert h.active_number() == (2 if moves else 1)
 
+    def test_the_capped_margin_moves_when_both_resets_are_near(self, temp_home):
+        """Review 2026-11-06: der Deckel galt nur auf der Headroom-Achse. Kommt der
+        aktive Account binnen RECOVERY_HORIZON_S zurück, rankt der Fork nach Recovery,
+        und ein Peer mit MEHR Platz, aber späterem Reset, fiel durch: aktiv 95 % mit
+        Reset in 2 h, Peer 91 % mit Reset in 3 h -> kein Wechsel, der aktive lief bis
+        100 % und in das harte Session-Limit von Claude Code."""
+        h = self._fleet_of(temp_home, 2, threshold=90.0, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "1": _usage(95, self._at(h, 2 * 3600)),   # active, 5 pts, back in 2h
+            "2": _usage(91, self._at(h, 3 * 3600)),   # 9 pts, back in 3h
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        # Der Rückweg: 1 kommt früher zurück, hat sich aber nicht erholt. Die
+        # No-Return-Sperre hält, sonst wäre das der Flap über die Recovery-Achse.
+        for _ in range(3):
+            h.clock.advance(400.0)
+            outcome = h.tick_with_usage({
+                "1": _usage(95, self._at(h, 2 * 3600)),
+                "2": _usage(92, self._at(h, 3 * 3600)),
+            })
+            assert h.active_number() == 2, f"zurück auf 1 ({outcome}) — Flap"
+
+    def test_the_spent_band_still_ranks_by_recovery(self, temp_home):
+        """Unter SPENT_HEADROOM_PCT Rest beim aktiven Account bleibt es beim Fork:
+        dort ist ein Headroom-Vorsprung Rauschen, und wer später zurückkommt, wird
+        nicht genommen."""
+        h = self._fleet_of(temp_home, 2, threshold=90.0, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "1": _usage(98, self._at(h, 2 * 3600)),   # active, 2 pts
+            "2": _usage(95, self._at(h, 3 * 3600)),   # 5 pts, later back
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
     @pytest.mark.parametrize(
         "departure, recovery",
         # Upstream prüft zusätzlich einen Fall unter dem Deckel (aktiv <= 3 Punkte).
